@@ -2,6 +2,15 @@
   "name": "dsh-env-injector",
   "version": "0.2.0",
   "description": "DSH plugin: rule-driven, per-spawn environment injection (e.g. GH_TOKEN for gh/git) with hot-reloadable settings",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ghisgit/dsh-env-injector.git"
+  },
+  "homepage": "https://github.com/ghisgit/dsh-env-injector#readme",
+  "bugs": {
+    "url": "https://github.com/ghisgit/dsh-env-injector/issues"
+  },
+  "author": "ghisgit",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
