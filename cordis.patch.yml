@@ -1,0 +1,82 @@
+# dsh-env-injector bundle layer: wrap ctx.subprocess.spawn with rule-driven,
+# per-spawn environment injection.
+#
+# This row is the plugin's COMPOSITION layer — the `base` of its settings
+# namespace. It ships with NO RULES, so an install that configures nothing
+# injects nothing: the plugin is a live hook, not a policy. Every injected
+# variable comes from a rule a deployment writes itself, either here or in
+# `$DSH_HOME/settings.yaml`.
+#
+# `$DSH_HOME/settings.yaml` resolves ABOVE this row, which is what makes rule
+# edits live: the settings provider watches that file and commits each change
+# to the running plugin. Add your rules there — it needs no restart:
+#
+#   env-injector:
+#     rules:
+#       - command: '^gh(\.exe)?$'
+#         envVar: GH_TOKEN
+#         enabled: true
+#
+# Add them here instead when the rule set belongs to the deployment rather than
+# to one operator's settings file. Override this row from your profile patch
+# (`$DSH_HOME/profiles/<name>/cordis.patch.yml`) by id. A patch replaces the
+# targeted row's WHOLE config, so restate every key you still want:
+#
+#   - id: env-injector
+#     config:
+#       rules:
+#         - command: '^gh(\.exe)?$'
+#           envVar: GH_TOKEN
+#           enabled: true
+#
+# `command` and `argsPattern` are regex SOURCE strings — JSON-safe by design
+# (no slashes, no trailing flags; use `flags:` for those). `command` is tested
+# against the executable's file name (`/usr/bin/gh` is tested as `gh`, and the
+# full word as a fallback), `argsPattern` against the words after it (empty
+# means "any arguments").
+
+- insert:
+    - id: env-injector
+      name: 'dsh-env-injector'
+      config:
+        # No rules by default — add yours here or in settings.yaml. A rule
+        # matches one command (by executable name) and optionally its argument
+        # text, then copies one variable from the harness process environment
+        # into that child's environment only.
+        #
+        #   - command: '^gh(\.exe)?$'
+        #     argsPattern: ''
+        #     envVar: GH_TOKEN
+        #     enabled: true
+        #     flags: ''
+        #
+        # The git subcommands that talk to a remote are worth a rule of their
+        # own: a token is what makes the difference between a fast success and
+        # an interactive credential prompt the harness can never answer. The
+        # pattern tolerates the global flags that precede a subcommand, so
+        # `git -C /repo push`, `git -c k=v fetch` and `git --no-pager pull` all
+        # match.
+        #
+        #   - command: '^git(\.exe)?$'
+        #     argsPattern: '^(?:-[cC]\s+\S+\s+|--\S+(?:=\S+)?\s+)*(?:push|fetch|pull|clone|ls-remote)\b'
+        #     envVar: GH_TOKEN
+        #     enabled: true
+        #     flags: ''
+        #
+        # With `terminal: true` below, a persistent-shell composition (the
+        # `minimal` preset) needs the rule on the SHELL instead — that session
+        # is ONE long-lived process, so it is the only thing ever spawned:
+        #
+        #   - command: '^bash$'        # the PTY argv is /bin/bash --noprofile --norc
+        #     envVar: GH_TOKEN
+        rules: []
+        # The harness-process value wins over an explicit value in the spawn
+        # spec, so a model-supplied `env` cannot spoof the token.
+        overrideExisting: true
+        # Also apply the rules to `ctx.subprocess.spawnTerminal` (PTY sessions).
+        # Leaving this on costs nothing for command-shaped rules: a shell's own
+        # argv never matches `^gh$`.
+        terminal: true
+        # Turn on to log every match (`info`) and miss (`debug`) through the
+        # `env-injector` logger.
+        logMatches: false

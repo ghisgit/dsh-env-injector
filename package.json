@@ -1,0 +1,72 @@
+{
+  "name": "dsh-env-injector",
+  "version": "0.2.0",
+  "description": "DSH plugin: rule-driven, per-spawn environment injection (e.g. GH_TOKEN for gh/git) with hot-reloadable settings",
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "src",
+    "scripts",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "resolve-rules": "node scripts/resolve-rules.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "subprocess",
+    "environment",
+    "env-injector"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-settings": "^0.1.5-rc.1",
+    "@deepseek-ai/dsh-subprocess": "^0.1.5-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/cosmokit": "1.8.3",
+    "@deepseek-ai/dsh-sandbox": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-sandbox-local": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-settings": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-settings-file": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-subprocess": "0.1.5-rc.1",
+    "@deepseek-ai/dsh-subprocess-local": "0.1.5-rc.1",
+    "@deepseek-ai/schemastery": "3.18.2",
+    "@types/node": "^24.0.0",
+    "js-yaml": "^4.3.2",
+    "typescript": "~5.9.3"
+  }
+}

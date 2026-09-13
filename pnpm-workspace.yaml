@@ -1,0 +1,10 @@
+# pnpm records build-script approvals for dependencies here. The three entries
+# below belong to @deepseek-ai/dsh-subprocess-local (a DEV dependency, used by
+# the end-to-end test as the real subprocess provider): koffi and node-pty back
+# its PTY and process-inspection paths, which the plain `spawn` path these tests
+# exercise does not need. Set them to true to build those natives; the plugin
+# itself has no runtime dependency on them.
+allowBuilds:
+  '@deepseek-ai/dsh-subprocess-local': false
+  koffi: false
+  node-pty: true
