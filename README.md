@@ -1,5 +1,7 @@
 # dsh-env-injector
 
+**English** | [简体中文](README.zh.md)
+
 Rule-driven, **per-command** environment injection for the [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness).
 
 DSH builds every child environment from `scrubbedParentEnv()`, which strips
