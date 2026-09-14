@@ -411,10 +411,11 @@ test('without a tools service the guard still refuses, and says redaction is una
   let booted
   try {
     booted = await bootGuarded({ rules: [...COMPOSITION_RULES, { command: '^env$', argsPattern: '', envVar: 'GH_TOKEN', enabled: true, flags: '' }] })
-    /* The load notices are emitted from a `setTimeout(…, 0)`, so let the
-     * event loop turn before judging what was written. */
+    /* The load notices are only emitted after the plugin's settle window, which
+     * waits for a settings service that may still be mounting. Give it that
+     * window (3 s) plus a margin before judging what was written. */
     await new Promise((resolve) => {
-      setTimeout(resolve, 0)
+      setTimeout(resolve, 3_200)
     })
   } finally {
     process.stderr.write = original

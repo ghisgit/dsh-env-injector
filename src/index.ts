@@ -1442,32 +1442,32 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
   }
 
   /**
-   * Report once the optional services have had a fair chance to appear.
+   * Report once the settings service has had its chance to appear.
    *
-   * A service that mounts a moment after this plugin is not distinguishable
-   * from one that is absent, so the fallback waits a bounded window before
-   * declaring the composition entry authoritative. In a normal boot the
-   * settings attach reports immediately and this window is never noticed; it
-   * exists for the deployment where a later bundle layer mounts the settings
-   * service, and it is what keeps a "no rules enabled" line from being printed
-   * for a deployment that has rules.
+   * A service that a later (or simply slower) bundle layer mounts is not
+   * distinguishable from one that is absent, so the fallback waits before
+   * declaring the composition entry authoritative. Waiting is the cheap side of
+   * this trade: the cost of a long window is that one log line appears later,
+   * while the cost of a short one is a line claiming "no rules enabled" for a
+   * deployment that has rules — and the log is the only place "which rules
+   * won?" is answerable.
+   *
+   * A mounted service resolves its namespace within a tick of mounting, so a
+   * single window covers both. The line is reported here at the deadline, or
+   * much earlier by the attach callback whenever that comes first.
    */
-  const settleWindowMs = 250
-  const settleDeadline = Date.now() + settleWindowMs
+  const settingsWaitMs = 3000
+  const settingsDeadline = Date.now() + settingsWaitMs
   const awaitSettings = (): void => {
     if (settingsAttached) {
       reportRules()
       reportGuard()
       return
     }
-    if (!settingsServicePresent() && Date.now() >= settleDeadline) {
-      /* No provider arrived: the composition entry IS the authoritative source. */
-      reportRules()
-      reportGuard()
-      return
-    }
-    if (settingsServicePresent() && Date.now() >= settleDeadline + 500) {
-      note(log, 'warn', `the settings service is mounted but the '${NS}' namespace did not resolve; the composition entry stays authoritative`)
+    if (Date.now() >= settingsDeadline) {
+      if (settingsServicePresent()) {
+        note(log, 'warn', `the settings service is mounted but the '${NS}' namespace did not resolve; the composition entry stays authoritative`)
+      }
       reportRules()
       reportGuard()
       return
@@ -1556,14 +1556,11 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
 
   /*
    * Both optional services resolve asynchronously, so neither can be judged
-   * synchronously here. Wait a tick, let every already-resolvable `inject`
-   * callback settle, then wait out a settings service that is present but has
-   * not resolved its namespace yet.
+   * synchronously here: wait out a settings service that has not appeared or
+   * not resolved yet, then report the guard too (its "no registry" warning must
+   * not fire before a registry had its chance to mount).
    */
-  setTimeout(() => {
-    reportGuard()
-    awaitSettings()
-  }, 0).unref()
+  setTimeout(awaitSettings, 0).unref()
 }
 
 export default { name, inject, Config, apply }

@@ -107,12 +107,14 @@ dsh web 2>&1 | grep '\[env-injector\]'              # foreground: they go to std
 
 The `wrapping …` line is the authoritative one. It is reported only once the
 source that will actually be used has resolved, and it is re-reported if that
-source changes afterwards: the settings namespace can attach well after the
-plugin is applied (its document is read first, and a later bundle layer can
-mount the settings service), so the plugin waits a bounded window before naming
-the composition entry as authoritative. `no rules enabled` there therefore means
-what it says. A load with no settings provider prints the same line after that
-window, with `(source: composition entry only)`.
+source changes afterwards. The settings namespace can attach well after the
+plugin is applied — its document is read first, and the service itself may be
+mounted by a later or slower bundle layer — so the plugin waits up to three
+seconds before naming the composition entry as authoritative, and a service
+that mounts but never resolves its namespace gets a warning instead of a silent
+wait. `no rules enabled` there therefore means what it says: nothing is
+configured anywhere. A load with no settings provider prints the same line after
+that window, with `(source: composition entry only)`.
 
 Those notices go to **stderr** because cordis' logger is the idiomatic channel
 but the shipped composition mounts no logger *exporter* (its default sink is an
