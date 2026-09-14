@@ -140,6 +140,22 @@ test('a nested shell resolves to the innermost command', () => {
   assert.deepEqual(extractInvocations(BWRAP_ARGV("sudo -E bash -c 'git push'")), [{ command: 'git', path: 'git', args: 'push' }])
 })
 
+/* `bash -lc '…'` and friends are the documented POSIX spellings, so the command
+ * flag has to be recognised inside a short-option cluster. Otherwise the shell
+ * is never unwrapped, the spawn reads as an opaque `bash -lc …` argv, and a
+ * `^gh$`/`^git$` rule silently matches nothing. */
+test('a shell launched with a combined option cluster is unwrapped', () => {
+  assert.deepEqual(extractInvocations(['bash', '-lc', 'gh pr list']), [{ command: 'gh', path: 'gh', args: 'pr list' }])
+  assert.deepEqual(extractInvocations(['sh', '-ec', 'git push origin main']), [{ command: 'git', path: 'git', args: 'push origin main' }])
+  assert.deepEqual(extractInvocations(BWRAP_ARGV("bash -ic 'gh pr view 1'")), [{ command: 'gh', path: 'gh', args: 'pr view 1' }])
+})
+
+test('rules match through a combined option cluster', () => {
+  const rules = compiled(GH_GIT_RULES).rules
+  assert.equal(matchRules(extractInvocations(BWRAP_ARGV("bash -lc 'git push'")), rules).length, 1)
+  assert.equal(matchRules(extractInvocations(['bash', '-lc', 'git status']), rules).length, 0)
+})
+
 test('a wrapper-launched command resolves to the wrapped command', () => {
   assert.deepEqual(extractInvocations(['env', '-i', 'FOO=1', 'gh', 'pr', 'list']), [{ command: 'gh', path: 'gh', args: 'pr list' }])
 })

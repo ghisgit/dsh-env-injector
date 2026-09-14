@@ -108,3 +108,16 @@ test('a reference captured before teardown passes arguments through', () => {
   assert.equal(runtime.calls.at(-1).spec, spec)
   assert.equal(typeof captured, 'function')
 })
+
+test('a combined shell flag is unwrapped like a plain `-c`', () => {
+  /* `bash -lc '…'` is a documented POSIX invocation and must not read as an
+   * opaque argv: the rule has to see what the command line will run. */
+  const runtime = new StubRuntime()
+  const dispose = installSpawnInjection(runtime, ['spawn'], () => compiled(GH_ON_SHELL), silentLogger)
+  const spec = { argv: ['bash', '-lc', 'gh pr list'], cwd: '/workspace', env: { KEEP: '1' } }
+  runtime.spawn(spec)
+  assert.equal(runtime.calls.at(-1).spec.env.WRAP_TOKEN, 'wrapper-value', 'the inner gh matched through -lc')
+  assert.equal(runtime.calls.at(-1).spec.env.KEEP, '1', 'and the caller’s own entries survive')
+  assert.deepEqual(spec.env, { KEEP: '1' }, 'the caller’s spec object is not mutated')
+  dispose()
+})

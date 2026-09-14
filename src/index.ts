@@ -291,6 +291,25 @@ const SHELL_NAMES = new Set([
 const SHELL_COMMAND_FLAGS = new Set(['-c', '/c', '/k', '-command', '-cmd'])
 
 /**
+ * Whether one argv word is the flag that introduces a shell's command string.
+ *
+ * Long options and Windows switches are matched exactly (`-Command`, `/c`); a
+ * POSIX short-option cluster counts when it carries `c`, because `c` is the
+ * documented spelling of "read the command from the next operand" and shells
+ * are routinely invoked as `bash -lc '…'`, `sh -ec '…'` or `bash -ic '…'`.
+ * Without this, `bash -lc 'gh pr list'` reads as an opaque direct argv: the
+ * shell is never unwrapped, so no rule can select the command it will run.
+ *
+ * @param word - one argv word.
+ * @returns whether it selects the command operand.
+ */
+function isShellCommandFlag(word: string): boolean {
+  const lower = word.toLowerCase()
+  if (SHELL_COMMAND_FLAGS.has(lower)) return true
+  return /^-[A-Za-z]+$/.test(word) && lower.includes('c')
+}
+
+/**
  * Words that wrap another command. They contribute nothing to matching, so
  * `env GH_HOST=x gh pr list`, `sudo -E git push` and `nohup gh …` still match
  * their inner command.
@@ -336,7 +355,7 @@ export function executableName(word: string): string {
  */
 function stripLeadingAssignments(line: string): string {
   let rest = line.trimStart()
-  for (let guard = 0; guard < 8; guard += 1) {
+  for (let attempt = 0; attempt < 8; attempt += 1) {
     const separator = findStatementEnd(rest)
     if (separator === -1) return rest
     const statement = rest.slice(0, separator).trim()
@@ -501,14 +520,14 @@ function invocationOfWords(words: readonly string[]): Invocation | undefined {
 
 /**
  * The command string one shell invocation carries, if it is a shell launched
- * with a command flag (`bash -c …`, `pwsh -Command …`).
+ * with a command flag (`bash -c …`, `pwsh -Command …`, `bash -lc …`).
  * @param invocation - the command to inspect.
  * @returns the operand text after the flag, or `undefined` when there is none.
  */
 function nestedCommandLine(invocation: Invocation): string | undefined {
   if (!SHELL_NAMES.has(invocation.command.toLowerCase())) return undefined
   const words = invocation.args.split(' ').filter((word) => word.length > 0)
-  const flagIndex = words.findIndex((word) => SHELL_COMMAND_FLAGS.has(word.toLowerCase()))
+  const flagIndex = words.findIndex((word) => isShellCommandFlag(word))
   if (flagIndex === -1) return undefined
   return words.slice(flagIndex + 1).join(' ')
 }
@@ -550,8 +569,9 @@ function expandCommandLine(line: string, depth: number): Invocation[] {
  *
  * So the scan starts from the LAST command flag — the innermost one, whose
  * operand immediately follows it — and walks back to the shell that governs
- * it, allowing only further flags in between. A `-c` that belongs to a
- * non-shell (`git -c k=v push`) finds no shell and is ignored.
+ * it, allowing only further flags in between. A `-c` (or a short-option
+ * cluster carrying `c`, e.g. `-lc`) that belongs to a non-shell
+ * (`git -c k=v push`) finds no shell and is ignored.
  *
  * @param argv - the spawn spec's argv.
  * @returns the inner command string, or `undefined`.
@@ -559,7 +579,7 @@ function expandCommandLine(line: string, depth: number): Invocation[] {
 function findShellCommandLine(argv: readonly string[]): string | undefined {
   for (let flagIndex = argv.length - 2; flagIndex >= 1; flagIndex -= 1) {
     const flag = argv[flagIndex]
-    if (flag === undefined || !SHELL_COMMAND_FLAGS.has(flag.toLowerCase())) continue
+    if (flag === undefined || !isShellCommandFlag(flag)) continue
     for (let index = flagIndex - 1; index >= 0; index -= 1) {
       const word = argv[index]
       if (word === undefined) break
@@ -930,6 +950,28 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
     }
   }
 
+  /** Whether a settings service is mounted at all, namespace resolved or not. */
+  const settingsServicePresent = (): boolean => ctx.get('settings') !== undefined
+
+  /**
+   * Announce the rules every later spawn will use.
+   *
+   * The optional service cannot be judged from a single tick: the plugin is
+   * applied before the settings namespace is resolved (its document is read
+   * first), and a later bundle layer can mount the settings service afterwards.
+   * So a line reports the CURRENT state rather than claiming it once: while the
+   * service is still pending the report is deferred, and the line is re-emitted
+   * if the authoritative source changes after an earlier report.
+   */
+  let announcedRules: string | undefined
+  const reportRules = (): void => {
+    if (!settingsAttached && settingsServicePresent()) return
+    const line = `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`
+    if (line === announcedRules) return
+    announcedRules = line
+    note(log, 'info', line)
+  }
+
   ctx.inject(['settings'], (settingsCtx) => {
     const settings = settingsCtx.settings
     /*
@@ -969,21 +1011,53 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
      * what makes "did my settings section win?" answerable from a deployment
      * log without any further tooling. */
     note(log, 'info', `settings namespace '${NS}' attached — ${describeRules(compiled.rules)}`)
+    reportRules()
   })
 
   const runtime = subprocessRuntime(ctx.get('subprocess'))
   const methods: WrappedMethod[] = entry.terminal ? [...WRAPPED_METHODS] : ['spawn']
   const uninstall = installSpawnInjection(runtime, methods, () => compiled, log)
   ctx.effect(() => uninstall, 'env-injector: restore ctx.subprocess methods')
-  /*
-   * The settings service attaches asynchronously, so the authoritative source
-   * is only known one tick later — and that is exactly what an operator needs
-   * from the harness log: that the wrapper is installed, which rules it will
-   * use, and which layer supplied them.
+
+  /**
+   * Report once the settings service has had its chance to appear.
+   *
+   * A service that a later (or simply slower) bundle layer mounts is not
+   * distinguishable from one that is absent, so the fallback waits before
+   * declaring the composition entry authoritative. Waiting is the cheap side of
+   * this trade: the cost of a long window is that one log line appears later,
+   * while the cost of a short one is a line claiming "no rules enabled" for a
+   * deployment that has rules — and the log is the only place "which rules
+   * won?" is answerable.
+   *
+   * A mounted service resolves its namespace within a tick of mounting, so a
+   * single window covers both. The line is reported here at the deadline, or
+   * much earlier by the attach callback whenever that comes first.
    */
-  setTimeout(() => {
-    note(log, 'info', `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`)
-  }, 0).unref()
+  const settingsWaitMs = 3000
+  const settingsDeadline = Date.now() + settingsWaitMs
+  const awaitSettings = (): void => {
+    if (settingsAttached) {
+      reportRules()
+      return
+    }
+    if (Date.now() >= settingsDeadline) {
+      if (settingsServicePresent()) {
+        note(log, 'warn', `the settings service is mounted but the '${NS}' namespace did not resolve; the composition entry stays authoritative`)
+      }
+      reportRules()
+      return
+    }
+    setTimeout(awaitSettings, 25).unref()
+  }
+
+  /*
+   * The settings service may attach long after this plugin is applied, so the
+   * authoritative source is only known once that window has passed — and that
+   * is exactly what an operator needs from the harness log: that the wrapper is
+   * installed, which rules it will use, and which layer supplied them.
+   */
+  setTimeout(awaitSettings, 0).unref()
 }
 
 export default { name, inject, Config, apply }
