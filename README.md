@@ -104,10 +104,16 @@ dsh web 2>&1 | grep '\[env-injector\]'              # foreground: they go to std
 # [env-injector] wrapping ctx.subprocess.spawn/spawnTerminal — 1 rule(s): ^gh(\.exe)?$ → GH_TOKEN (source: settings.yaml over the composition entry)
 ```
 
-The `wrapping …` line is the authoritative one: it is emitted one tick later,
-after the settings layer has attached, so it names the rules really in force and
-the layer they came from. `no rules enabled` there means the plugin is loaded
-but inert.
+The `wrapping …` line is the authoritative one. It is reported only once the
+source that will actually be used has resolved, and it is re-reported if that
+source changes afterwards. The settings namespace can attach well after the
+plugin is applied — its document is read first, and the service itself may be
+mounted by a later or slower bundle layer — so the plugin waits up to three
+seconds before naming the composition entry as authoritative, and a service
+that mounts but never resolves its namespace gets a warning instead of a silent
+wait. `no rules enabled` there therefore means what it says: nothing is
+configured anywhere. A load with no settings provider prints the same line after
+that window, with `(source: composition entry only)`.
 
 Those notices go to **stderr** because cordis' logger is the idiomatic channel
 but the shipped composition mounts no logger *exporter* (its default sink is an
@@ -206,6 +212,16 @@ env-injector:
       envVar: GH_TOKEN
       enabled: true
 ```
+
+> **A `^bash$` rule does NOT cover `bash -c '<command>'`.** Matching looks
+> *through* a shell to the commands it runs, on purpose: `^gh$` has to match
+> `bash -c 'gh pr list'`, which is the only shape the harness bash tool ever
+> spawns. So a fresh-shell composition (`standard` preset) needs rules for the
+> **commands** (`^gh$`, `^git$`), and a `^bash$` rule there matches nothing at
+> all — it looks harmless in the log, because the plugin summarises whatever
+> rules are configured, not which ones have fired. `^bash$` earns its place in
+> exactly one case: the PTY argv above, where the shell is the whole process.
+> Set `logMatches: true` to see which rules actually fire.
 
 Two consequences belong to long-lived shells, not to this plugin:
 
@@ -374,14 +390,48 @@ so `git push` over HTTPS works without an interactive prompt.
 
 ## Security notes
 
-* A matched command — and **everything it spawns** — can read the injected
-  value. Keep rules narrow; `command: '.*'` forwards the token to every child.
-* The value overrides an explicit `spec.env` entry by default
-  (`overrideExisting: true`) so a model-supplied `env` cannot spoof the token.
-  Set it to `false` to let an explicit caller value win.
-* Injection always wins over the harness scrub *by design*: it is the same
+### What the plugin never does
+
+* **No value is ever logged.** Every notice names variables, rules and command
+  lines — never their contents. `logMatches` writes `injected GH_TOKEN for: …`,
+  not the token.
+* **`process.env` is never written**, and the injected entry lives in one spec
+  object for one spawn.
+* **`overrideExisting: true` by default**, so a model-supplied `env` cannot
+  spoof a var the harness owns. Set it to `false` to let an explicit caller
+  value win.
+* **Injection wins over the harness scrub by design**: it is the same
   explicit-`env` layer a trusted caller would use. The scrub keeps protecting
   every other variable and every non-matching command.
+
+### What injection does NOT protect you from
+
+There is no read guard in this plugin: the promise is *delivery*, not
+*containment*. A value that is injected is a value a child process holds.
+
+* A matched command — and **everything it spawns** — can read the injected
+  value. `env`, `printenv` and `bash -c 'echo $GH_TOKEN'` receive it like any
+  other command, and nothing rewrites a tool result on the way back to the
+  model, so a single echo of the variable is a single disclosure.
+* A command that receives the value can leak it **without printing it**: writing
+  it to a file, feeding it to a hook or another program, sending it over the
+  network. `git push` runs `.git/hooks/*`, which a model with workspace write
+  access can author. No environment-layer defence can see that.
+* Long-lived sessions are the widest case: a PTY (`spawnTerminal`) holds the
+  variable for the life of the session, and a background job keeps it for the
+  life of the job.
+* A command line assembled at runtime (`bash -c "$CMD"`) is matched — the shell
+  is unwrapped either way — but that also means the *caller's* command line, not
+  yours, decides what runs with the variable.
+
+### The practical minimum
+
+Narrow rules: `^git(\.exe)?$` with an `argsPattern` rather than `.*`, so
+`git status` never carries a token. Prefer short-lived, low-privilege
+credentials (a fine-grained token rather than a classic one). And when the token
+must not be readable at all, do not hand it over as an environment variable —
+use a credential helper, an agent socket or a proxy that keeps the secret
+outside the child.
 
 ## Limitations
 
@@ -396,13 +446,19 @@ so `git push` over HTTPS works without an interactive prompt.
 * Bare numeric operands after a wrapper are skipped (`nice -n 5 gh`), but a rule
   is not evaluated against a wrapper's own arguments.
 * Rule arrays replace wholesale; there is no per-rule merge or stable rule id.
+* Rule regexes are validated when the config is compiled, not by the schema, so
+  a bad pattern in `settings.yaml` is refused at read time and the previous
+  rules stay in force — the spawn keeps its old behaviour rather than losing
+  injection silently.
 
 ## Development
 
 ```bash
 pnpm install                    # add --registry=https://registry.npmjs.org/ if your mirror lacks the rc builds
 pnpm build                      # tsc → lib/ (committed: the loader imports lib/index.js)
-pnpm test                       # 57 tests: matching, injection, live settings, older-provider fallback, packaging
+pnpm test                       # 60 tests: matching, injection, live settings, older-provider fallback, packaging
+pnpm resolve-rules              # which rules are really in force right now
+pnpm acceptance                 # the real seams: a real child process, a real settings.yaml
 ```
 
 | File | Role |
@@ -411,6 +467,7 @@ pnpm test                       # 57 tests: matching, injection, live settings, 
 | `lib/index.js` | Built output — what `dsh` actually imports (one runtime import: `@deepseek-ai/schemastery`). |
 | `cordis.patch.yml` | The bundle layer: one `insert` row whose composition entry carries an empty `rules:` list (the commented example rules are the documented starting point, not defaults). |
 | `scripts/resolve-rules.mjs` | Offline probe: applies defaults → composition entry → `settings.yaml` by hand and prints which rules are really in force, since `--dump-config` cannot show the settings layer. |
+| `scripts/acceptance.mjs` | The checks the unit suite cannot make because they need a deployment's real packages: a real child process receives a real token through the real `ctx.subprocess` service, and a `settings.yaml` edit re-rules it live. Verified against DSH `0.1.5-rc.1`. |
 | `test/match.test.mjs` | Pure matching/injection unit tests, including the pass-through identity guarantee. |
 | `test/sandbox.test.mjs` | The real sandbox provider + real subprocess provider: asserts the confined argv shape and that injection survives it. |
 | `test/e2e.test.mjs` | Real `dsh-subprocess-local` + real `dsh-settings-file`: a real `bash` child prints its own environment, a real `settings.yaml` edit re-rules it live, and the older-provider fallback runs with `installSection` removed from the real service. |
