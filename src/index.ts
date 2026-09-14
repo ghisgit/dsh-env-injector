@@ -1398,52 +1398,81 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
   /** Whether a tool registry is mounted at all, callbacks settled or not. */
   const toolsServicePresent = (): boolean => ctx.get('tools') !== undefined
 
+  /** Whether a settings service is mounted at all, namespace resolved or not. */
+  const settingsServicePresent = (): boolean => ctx.get('settings') !== undefined
+
   /**
    * Announce the state the plugin settled into — the rules and the guard that
    * every later spawn will use.
    *
-   * This is deliberately NOT printed from a bare `setTimeout(…, 0)`: against a
-   * real deployment the settings service attaches a tick later than that (its
-   * document is read before the namespace resolves), so a fixed-tick banner
-   * reports the composition entry as "no rules enabled" while the user's
-   * `settings.yaml` rules are already on their way in. Instead each line is
-   * emitted by the source that makes it true: the rules line by whichever
-   * source becomes authoritative first (the settings attach, or the
-   * no-provider path), and the guard line by the point where the tool registry
-   * has settled, re-emitted once if it attached later.
+   * Neither optional service can be judged from a single tick: the plugin is
+   * applied before the settings namespace is resolved (its document is read
+   * first), and a later bundle layer can mount the settings service afterwards.
+   * So a line reports the CURRENT state rather than claiming it once: while
+   * something is still pending the report is deferred, and the rules line is
+   * re-emitted if the authoritative source changes after an earlier report.
    */
-  let announcedRules = false
+  let announcedRules: string | undefined
   const reportRules = (): void => {
-    if (announcedRules) return
-    announcedRules = true
-    note(log, 'info', `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`)
+    if (!settingsAttached && settingsServicePresent()) return
+    const line = `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`
+    if (line === announcedRules) return
+    announcedRules = line
+    note(log, 'info', line)
   }
 
-  /**
-   * Whether output redaction is known to be unavailable.
-   *
-   * The tool registry is either already mounted — in which case its injection
-   * callback runs in the same drain as this check — or it is genuinely absent.
-   * That distinction is what keeps the notice below from firing while a mounted
-   * registry is merely still settling.
-   */
+  /** Whether output redaction is known to be unavailable. */
   const redactionState = (): 'ready' | 'unavailable' | 'pending' => {
     if (redactionAttached) return 'ready'
     return toolsServicePresent() ? 'pending' : 'unavailable'
   }
 
-  /** Report the guard, at most twice: once when it settles, once if it changes. */
-  let guardReported: string | undefined
+  /** Report the guard; re-emitted only when the reported state changes. */
+  let announcedGuard: string | undefined
   const reportGuard = (): void => {
     const state = redactionState()
     if (state === 'pending') return
     const line = `guard: ${describeGuard(compiled.guard)}${state === 'ready' ? '' : ' — output redaction unavailable (no tools service mounted)'}`
-    if (line === guardReported) return
-    guardReported = line
+    if (line === announcedGuard) return
+    announcedGuard = line
     note(log, 'info', line)
     if (state === 'unavailable' && compiled.guard.redactOutput) {
       note(log, 'warn', 'guard.redactOutput is on but no tools service is mounted; injected values can still be echoed into a result')
     }
+  }
+
+  /**
+   * Report once the optional services have had a fair chance to appear.
+   *
+   * A service that mounts a moment after this plugin is not distinguishable
+   * from one that is absent, so the fallback waits a bounded window before
+   * declaring the composition entry authoritative. In a normal boot the
+   * settings attach reports immediately and this window is never noticed; it
+   * exists for the deployment where a later bundle layer mounts the settings
+   * service, and it is what keeps a "no rules enabled" line from being printed
+   * for a deployment that has rules.
+   */
+  const settleWindowMs = 250
+  const settleDeadline = Date.now() + settleWindowMs
+  const awaitSettings = (): void => {
+    if (settingsAttached) {
+      reportRules()
+      reportGuard()
+      return
+    }
+    if (!settingsServicePresent() && Date.now() >= settleDeadline) {
+      /* No provider arrived: the composition entry IS the authoritative source. */
+      reportRules()
+      reportGuard()
+      return
+    }
+    if (settingsServicePresent() && Date.now() >= settleDeadline + 500) {
+      note(log, 'warn', `the settings service is mounted but the '${NS}' namespace did not resolve; the composition entry stays authoritative`)
+      reportRules()
+      reportGuard()
+      return
+    }
+    setTimeout(awaitSettings, 25).unref()
   }
 
   ctx.inject(['settings'], (settingsCtx) => {
@@ -1528,13 +1557,12 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
   /*
    * Both optional services resolve asynchronously, so neither can be judged
    * synchronously here. Wait a tick, let every already-resolvable `inject`
-   * callback settle, then announce whatever is still unannounced: with a
-   * settings provider the attach above has already reported; without one this is
-   * what names the composition entry as the authoritative source.
+   * callback settle, then wait out a settings service that is present but has
+   * not resolved its namespace yet.
    */
   setTimeout(() => {
-    reportRules()
     reportGuard()
+    awaitSettings()
   }, 0).unref()
 }
 

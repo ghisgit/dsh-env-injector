@@ -105,13 +105,14 @@ dsh web 2>&1 | grep '\[env-injector\]'              # foreground: they go to std
 # [env-injector] guard: reads=deny shells=off redact=on
 ```
 
-The `wrapping …` line is the authoritative one, and it is emitted only once the
-source that will actually be used has resolved — `installSection` calls back
-into the plugin synchronously, so the banner can never report the composition
-entry as `no rules enabled` while `settings.yaml` rules are on their way in.
-`no rules enabled` there therefore means what it says: nothing is configured.
-A load without a settings provider prints the same line from the next tick,
-with `(source: composition entry only)`.
+The `wrapping …` line is the authoritative one. It is reported only once the
+source that will actually be used has resolved, and it is re-reported if that
+source changes afterwards: the settings namespace can attach well after the
+plugin is applied (its document is read first, and a later bundle layer can
+mount the settings service), so the plugin waits a bounded window before naming
+the composition entry as authoritative. `no rules enabled` there therefore means
+what it says. A load with no settings provider prints the same line after that
+window, with `(source: composition entry only)`.
 
 Those notices go to **stderr** because cordis' logger is the idiomatic channel
 but the shipped composition mounts no logger *exporter* (its default sink is an
@@ -505,6 +506,7 @@ pnpm install                    # add --registry=https://registry.npmjs.org/ if 
 pnpm build                      # tsc → lib/ (committed: the loader imports lib/index.js)
 pnpm test                       # 84 tests: matching, injection, guard, redaction, live settings, fallback, packaging
 pnpm resolve-rules              # which rules AND which guard are really in force right now
+pnpm acceptance                 # the real seams: real child process, real tool registry, real settings.yaml
 ```
 
 | File | Role |
@@ -514,6 +516,7 @@ pnpm resolve-rules              # which rules AND which guard are really in forc
 | `lib/index.js` | Built output — what `dsh` actually imports (one runtime import: `@deepseek-ai/schemastery`). |
 | `cordis.patch.yml` | The bundle layer: one `insert` row whose composition entry carries an empty `rules:` list (the commented example rules are the documented starting point, not defaults). |
 | `scripts/resolve-rules.mjs` | Offline probe: applies defaults → composition entry → `settings.yaml` by hand and prints which rules AND which guard are really in force, since `--dump-config` cannot show the settings layer. |
+| `scripts/acceptance.mjs` | The checks the unit suite cannot make because they need a deployment's real packages: a real child process receives a real token, the guard refuses `env`/`printenv`, the real `postExecute` waterfall redacts the result, and a `settings.yaml` edit re-rules it live. Verified against DSH `0.1.5-rc.1`. |
 | `test/match.test.mjs` | Pure matching/injection unit tests, including the pass-through identity guarantee. |
 | `test/guard.test.mjs` | The read guard: reader refusal (as command, pipeline stage and wrapper), the `shells` policy, and the redaction contract (raw/base64/hex, short values, non-text blocks). |
 | `test/sandbox.test.mjs` | The real sandbox provider + real subprocess provider: asserts the confined argv shape and that injection survives it. |

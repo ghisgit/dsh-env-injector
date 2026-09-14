@@ -33,7 +33,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "resolve-rules": "node scripts/resolve-rules.mjs",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "acceptance": "node scripts/acceptance.mjs"
   },
   "keywords": [
     "deepseek-harness",
