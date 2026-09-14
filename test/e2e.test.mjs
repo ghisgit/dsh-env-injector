@@ -332,6 +332,7 @@ async function bootGuarded(config, extra) {
       await handle.done
       return `${handle.collected.stdout.readFrom(0).text}${handle.collected.stderr.readFrom(0).text}`
     },
+    ctx: bare,
     dispose: () => bare.fiber.dispose(),
   }
 }
@@ -354,30 +355,47 @@ test('the read guard stops a real child from being handed the token', async () =
 })
 
 test('the redaction hook scrubs an injected value out of a tool result', async () => {
-  /* A minimal stand-in for the tool registry: the plugin resolves `tools` as an
-   * optional service and registers one `tools/post-execute` listener, which is
-   * the whole contract the redaction layer depends on. */
-  const listeners = new Map()
+  /* A stand-in for the tool registry that mirrors the REAL structure: the
+   * provided service carries no `on` at all (exactly like `ToolRuntime`, whose
+   * events live on the injection CONTEXT). An earlier fake exposed `on` on the
+   * service object, so it passed while the plugin attached to the wrong thing —
+   * `drive` below is what makes that failure visible. */
   const fakeTools = {
     name: 'tools',
     apply(fakeCtx) {
-      fakeCtx.provide('tools', { on: (event, listener) => listeners.set(event, listener) })
+      /* No `on` on the service. */
+      fakeCtx.provide('tools', {})
+      /* The registry's own dispatch walks the context's waterfall. Model that by
+       * registering a recorder first and letting each later listener nest. */
+      const chain = []
+      const registrar = {
+        /* Only the plugin uses this, through the context; the test never does. */
+        on: (name, listener) => { chain.push({ name, listener }) },
+      }
+      fakeCtx.on = registrar.on
+      fakeCtx.provide('toolsDrive', {
+        async drive(exec, result, fallback) {
+          const active = [...chain]
+          const step = async (index) => {
+            if (index >= active.length) return { kind: 'accept', content: fallback }
+            return active[index].listener(exec, result, () => step(index + 1))
+          }
+          return step(0)
+        },
+      })
     },
   }
-  const { run, dispose } = await bootGuarded({ rules: COMPOSITION_RULES }, async (bare) => {
+  const { run, ctx: guardedCtx, dispose } = await bootGuarded({ rules: COMPOSITION_RULES }, async (bare) => {
     await bare.plugin(fakeTools, {})
   })
   try {
-    assert.equal(listeners.has('tools/post-execute'), true, 'the plugin attached its redaction listener')
     /* A real spawn first, so the plugin knows which variables are in play. */
     assert.equal(await run('gh --version >/dev/null 2>&1; printf "token=[%s]" "$GH_TOKEN"'), `token=[${TOKEN}]`)
-    const listener = listeners.get('tools/post-execute')
-    const decision = await listener({ name: 'bash' }, {}, async () => ({
-      kind: 'accept',
-      content: [{ type: 'text', text: `$ env | grep GH_TOKEN\nGH_TOKEN=${TOKEN}\n` }],
-    }))
-    assert.equal(decision.content[0].text, '$ env | grep GH_TOKEN\nGH_TOKEN=[redacted:GH_TOKEN]\n', 'the leak is replaced with the marker')
-    assert.equal(JSON.stringify(decision).includes(TOKEN), false, 'and the raw value is gone from the projection')
+    const content = [{ type: 'text', text: `$ env | grep GH_TOKEN\nGH_TOKEN=${TOKEN}\n` }]
+    const decision = await guardedCtx.toolsDrive.drive({ name: 'bash' }, { content }, content)
+    const modelFacing = JSON.stringify(decision.content ?? content)
+    assert.equal(modelFacing.includes(TOKEN), false, 'the raw value is gone from the model-facing projection')
+    assert.match(modelFacing, /\[redacted:GH_TOKEN\]/, 'and it says what was removed')
   } finally {
     await dispose()
   }

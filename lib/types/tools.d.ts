@@ -46,14 +46,23 @@ export type ToolDecision = {
     readonly feedback: readonly ToolResultBlock[];
     readonly additionalContexts?: unknown;
 };
-/** The registry surface this plugin attaches to: one listener registration. */
+/**
+ * The surface this plugin attaches to: one listener registration.
+ *
+ * Note WHAT it is attached to. A cordis service INSTANCE is not an event
+ * emitter — `@deepseek-ai/dsh-tools`' `ToolRuntime` has no `on` at all, and
+ * `ctx.get('tools')` returns exactly that instance. Events are a CONTEXT
+ * facility, so the registration belongs on the scoped context that
+ * `ctx.inject(['tools'], …)` hands back (which is what DSH's own
+ * `dsh-spill-policy` does). Getting this wrong fails silently: the inject
+ * callback fires, the cast finds no `on`, and redaction is never installed.
+ */
 export interface ToolEventSource {
     on(name: 'tools/post-execute', listener: (this: unknown, exec: unknown, result: ToolResultLike, next: () => Promise<ToolDecision>) => Promise<ToolDecision>): unknown;
 }
 /**
- * Narrow an injected service to the one registration this plugin needs.
- * @param view - the value read from `ctx.get('tools')`.
- * @returns the registrar view, or `undefined` when the service is absent or not
- *   the shape this hook needs.
+ * Narrow a services context to the one registration this plugin needs.
+ * @param view - the context the tools injection handed back.
+ * @returns the registrar view, or `undefined` when it is not an event source.
  */
 export declare function asToolEventSource(view: unknown): ToolEventSource | undefined;

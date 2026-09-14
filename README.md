@@ -105,10 +105,13 @@ dsh web 2>&1 | grep '\[env-injector\]'              # foreground: they go to std
 # [env-injector] guard: reads=deny shells=off redact=on
 ```
 
-The `wrapping …` line is the authoritative one: it is emitted one tick later,
-after the settings layer has attached, so it names the rules really in force and
-the layer they came from. `no rules enabled` there means the plugin is loaded
-but inert.
+The `wrapping …` line is the authoritative one, and it is emitted only once the
+source that will actually be used has resolved — `installSection` calls back
+into the plugin synchronously, so the banner can never report the composition
+entry as `no rules enabled` while `settings.yaml` rules are on their way in.
+`no rules enabled` there therefore means what it says: nothing is configured.
+A load without a settings provider prints the same line from the next tick,
+with `(source: composition entry only)`.
 
 Those notices go to **stderr** because cordis' logger is the idiomatic channel
 but the shipped composition mounts no logger *exporter* (its default sink is an
@@ -269,8 +272,17 @@ env-injector:
       enabled: true
 ```
 
-Two consequences belong to long-lived shells, not to this plugin:
+> **A `^bash$` rule does NOT cover `bash -c '<command>'`.** Matching looks
+> *through* a shell to the commands it runs, on purpose: `^gh$` has to match
+> `bash -c 'gh pr list'`, which is the only shape the harness bash tool ever
+> spawns. So a fresh-shell composition (`standard` preset) needs rules for the
+> **commands** (`^gh$`, `^git$`), and a `^bash$` rule there matches nothing at
+> all — it looks harmless in the log, because the plugin summarises whatever
+> rules are configured, not which ones have fired. `^bash$` earns its place in
+> exactly one case: the PTY argv above, where the shell is the whole process.
+> Set `logMatches: true` to see which rules actually fire.
 
+Two consequences belong to long-lived shells, not to this plugin:
 * the environment is fixed when the shell starts — a rules edit affects the
   **next** session, not the shell already running;
 * the variable is visible to **everything** that shell runs, not just `gh`. For
@@ -394,6 +406,7 @@ logger. Only variable *names* are ever logged — never values.
 | Older `@deepseek-ai/dsh-settings` | Falls back automatically to `register()` + `watch()` + a disposal effect (see `src/index.ts`). |
 | No settings provider | Runs from the composition entry; every rule edit needs a restart (or a live patch edit). The shipped entry has no rules, so you must add them there. |
 | No tool registry | The read guard's denial layer is unaffected (it lives in the injection path). Output redaction is unavailable, and the load notice says so. |
+| Tool registry mounted the way DSH mounts it | The redaction listener registers on the **injection context** (`ctx.inject(['tools'], (toolsCtx) => toolsCtx.on('tools/post-execute', …))`), because a cordis service *instance* is not an event emitter: `ctx.get('tools')` returns a `ToolRuntime` with no `on` at all. This is verified against the real `@deepseek-ai/dsh-tools` registry, not only against the unit-test fake. |
 | No `ctx.subprocess` (pre-seam DSH) | The plugin simply never activates — `inject: ['subprocess']` is never satisfied, so nothing is patched and nothing fails. |
 
 The fallback path is feature-detected at runtime, not version-sniffed:

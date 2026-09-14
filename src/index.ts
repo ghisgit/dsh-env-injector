@@ -1395,6 +1395,57 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
     }
   }
 
+  /** Whether a tool registry is mounted at all, callbacks settled or not. */
+  const toolsServicePresent = (): boolean => ctx.get('tools') !== undefined
+
+  /**
+   * Announce the state the plugin settled into — the rules and the guard that
+   * every later spawn will use.
+   *
+   * This is deliberately NOT printed from a bare `setTimeout(…, 0)`: against a
+   * real deployment the settings service attaches a tick later than that (its
+   * document is read before the namespace resolves), so a fixed-tick banner
+   * reports the composition entry as "no rules enabled" while the user's
+   * `settings.yaml` rules are already on their way in. Instead each line is
+   * emitted by the source that makes it true: the rules line by whichever
+   * source becomes authoritative first (the settings attach, or the
+   * no-provider path), and the guard line by the point where the tool registry
+   * has settled, re-emitted once if it attached later.
+   */
+  let announcedRules = false
+  const reportRules = (): void => {
+    if (announcedRules) return
+    announcedRules = true
+    note(log, 'info', `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`)
+  }
+
+  /**
+   * Whether output redaction is known to be unavailable.
+   *
+   * The tool registry is either already mounted — in which case its injection
+   * callback runs in the same drain as this check — or it is genuinely absent.
+   * That distinction is what keeps the notice below from firing while a mounted
+   * registry is merely still settling.
+   */
+  const redactionState = (): 'ready' | 'unavailable' | 'pending' => {
+    if (redactionAttached) return 'ready'
+    return toolsServicePresent() ? 'pending' : 'unavailable'
+  }
+
+  /** Report the guard, at most twice: once when it settles, once if it changes. */
+  let guardReported: string | undefined
+  const reportGuard = (): void => {
+    const state = redactionState()
+    if (state === 'pending') return
+    const line = `guard: ${describeGuard(compiled.guard)}${state === 'ready' ? '' : ' — output redaction unavailable (no tools service mounted)'}`
+    if (line === guardReported) return
+    guardReported = line
+    note(log, 'info', line)
+    if (state === 'unavailable' && compiled.guard.redactOutput) {
+      note(log, 'warn', 'guard.redactOutput is on but no tools service is mounted; injected values can still be echoed into a result')
+    }
+  }
+
   ctx.inject(['settings'], (settingsCtx) => {
     const settings = settingsCtx.settings
     /*
@@ -1434,6 +1485,8 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
      * what makes "did my settings section win?" answerable from a deployment
      * log without any further tooling. */
     note(log, 'info', `settings namespace '${NS}' attached — ${describeRules(compiled.rules)}`)
+    reportRules()
+    reportGuard()
   })
 
   const runtime = subprocessRuntime(ctx.get('subprocess'))
@@ -1462,27 +1515,26 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
    */
   let redactionAttached = false
   ctx.inject(['tools'], (toolsCtx) => {
-    /* `ctx.get` rather than `toolsCtx.tools`: this package declares no service
-     * augmentation for the optional registry (see `src/tools.ts`), so the
-     * lookup is the seam. */
-    const tools = asToolEventSource(toolsCtx.get('tools'))
-    if (tools === undefined) return
-    tools.on('tools/post-execute', makeRedactionListener(() => compiled, () => injectedNames))
+    /* The registration goes on the injection CONTEXT, not on the service
+     * instance: cordis events are a context facility and the real
+     * `ToolRuntime` exposes no `on` at all (see `src/tools.ts`). */
+    const registrar = asToolEventSource(toolsCtx)
+    if (registrar === undefined) return
+    registrar.on('tools/post-execute', makeRedactionListener(() => compiled, () => injectedNames))
     redactionAttached = true
+    reportGuard()
   })
 
   /*
-   * The settings service attaches asynchronously, so the authoritative source
-   * is only known one tick later — and that is exactly what an operator needs
-   * from the harness log: that the wrapper is installed, which rules it will
-   * use, which layer supplied them, and whether the read guard is doing
-   * anything.
+   * Both optional services resolve asynchronously, so neither can be judged
+   * synchronously here. Wait a tick, let every already-resolvable `inject`
+   * callback settle, then announce whatever is still unannounced: with a
+   * settings provider the attach above has already reported; without one this is
+   * what names the composition entry as the authoritative source.
    */
   setTimeout(() => {
-    note(log, 'info', `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`)
-    note(log, 'info', `guard: ${describeGuard(compiled.guard)}${redactionAttached ? '' : ' — output redaction unavailable (no tools service mounted)'}`)
-    if (!compiled.guard.redactOutput || redactionAttached) return
-    note(log, 'warn', 'guard.redactOutput is on but no tools service is mounted; injected values can still be echoed into a result')
+    reportRules()
+    reportGuard()
   }, 0).unref()
 }
 
