@@ -127,6 +127,26 @@ test('the plugin loads and serves its settings namespace', async () => {
   assert.deepEqual(descriptor.value.rules, COMPOSITION_RULES, 'the resolved rules are the composed ones')
 })
 
+test('the describe wire carries what a configuration card renders', () => {
+  /* The browser half's card derives every control from ONE descriptor read:
+   * the serialized schema (what the namespace accepts), the resolved value and
+   * composition base (what a field shows and what a reset returns to), the raw
+   * user layer (a field's presence there is what marks it overridden), and the
+   * revision a write is fenced with. The wire must end every one of those
+   * JSON-safe, because that is the only form it reaches a browser in. */
+  const [descriptor] = ctx.settings.describe({ redactSecrets: true }).filter((entry) => entry.ns === 'env-injector')
+  assert.ok(descriptor !== undefined, 'the wire surface serves the namespace the card is keyed by')
+  assert.equal(typeof descriptor.revision, 'number', 'a write is fenced by the revision the card read')
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(descriptor.schema)),
+    descriptor.schema,
+    'the schema survives the wire',
+  )
+  assert.deepEqual(descriptor.value.rules, COMPOSITION_RULES)
+  assert.deepEqual(descriptor.base.rules, COMPOSITION_RULES, 'a reset previews what this layer holds')
+  assert.equal(descriptor.user, undefined, 'no user layer yet, so every field is unprefixed by a card')
+})
+
 test('a plugin loaded with no rules injects nothing at all', async () => {
   /* The shipped composition entry is empty, so this is the out-of-the-box
    * state: registered, wrapped, and inert. */

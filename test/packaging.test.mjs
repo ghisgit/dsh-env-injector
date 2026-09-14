@@ -7,7 +7,8 @@
  *   rule list, so an unconfigured install injects nothing — and whose
  *   documented example rule survives YAML → schema with its regex intact,
  * - `package.json` declares the bundle patch the `dsh plugin` reconciler looks
- *   for, and every path it publishes exists,
+ *   for and the `dsh.client` declaration the Web UI's module system serves,
+ *   and every path it publishes exists,
  * - the package resolves and unwraps from a profile-shaped `node_modules` the
  *   way `ctx.loader` resolves it (`default ?? namespace` → object plugin with
  *   `name`/`inject`/`Config`/`apply`).
@@ -38,6 +39,26 @@ test('every published entry point exists', () => {
   assert.equal(existsSync(join(root, manifest.exports['.'].default)), true)
   assert.equal(existsSync(join(root, manifest.exports['.'].types)), true)
   assert.equal(existsSync(join(root, manifest.exports['./cordis.patch.yml'])), true)
+  assert.equal(existsSync(join(root, manifest.exports['./client'].default)), true, 'the browser half is built')
+})
+
+test('the package declares the browser half the client module system serves', () => {
+  /* `dsh.client` is what makes the host scan this package as a browser plugin
+   * and serve `exports['./client']`; that half is what registers the card
+   * making the settings namespace configurable in the Web UI. Both faces live
+   * in this one package: the node half is the Loader row, the browser half is
+   * the `./client` export. */
+  assert.deepEqual(manifest.dsh.client, { platform: 'web' })
+  const bundle = readFileSync(join(root, manifest.exports['./client'].default), 'utf8')
+  assert.ok(
+    bundle.includes(`window.__ModuleLoader__.load({\n\tid: ${JSON.stringify(manifest.name)},`),
+    'the client export is a lazy-CJS factory registered under the package name',
+  )
+  assert.match(bundle, /factory: \(require\) => \{/, 'the bundle hands the shell its own `require`')
+  assert.ok(
+    manifest.files.some((entry) => entry === 'lib' || entry.startsWith('lib/')),
+    'the built browser half ships with the package',
+  )
 })
 
 test('cordis.patch.yml inserts one row naming this package', () => {

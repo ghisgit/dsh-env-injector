@@ -4,7 +4,12 @@
 # its PTY and process-inspection paths, which the plain `spawn` path these tests
 # exercise does not need. Set them to true to build those natives; the plugin
 # itself has no runtime dependency on them.
+#
+# `esbuild` is approved because it is the browser-half bundler (`pnpm build`);
+# its install script validates the platform binary the optional dependency
+# provides, and denying it turns a working build into a confusing runtime error.
 allowBuilds:
   '@deepseek-ai/dsh-subprocess-local': false
+  esbuild: true
   koffi: false
   node-pty: true

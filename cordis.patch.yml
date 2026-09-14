@@ -17,6 +17,11 @@
 #         envVar: GH_TOKEN
 #         enabled: true
 #
+# The same section is editable in the browser: this package's client half
+# (`dsh.client` → exports["./client"]) registers an "Environment injection"
+# card in Settings → Plugins → Plugin configuration, and that card writes
+# exactly the user layer shown above.
+#
 # Add them here instead when the rule set belongs to the deployment rather than
 # to one operator's settings file. Override this row from your profile patch
 # (`$DSH_HOME/profiles/<name>/cordis.patch.yml`) by id. A patch replaces the
