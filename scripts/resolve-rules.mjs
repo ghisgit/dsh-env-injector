@@ -25,7 +25,7 @@ import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { load } from 'js-yaml'
-import { Config, compileConfig, describeGuard } from '../lib/index.js'
+import { Config, compileConfig } from '../lib/index.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
@@ -88,14 +88,6 @@ for (const [label, resolved] of layers) {
 console.log(
   `\nEFFECTIVE (${winner[0]}): ${winner[1].rules.filter((rule) => rule.enabled).length} enabled rule(s), ` +
     `overrideExisting=${winner[1].overrideExisting}, logMatches=${winner[1].logMatches}`
-)
-/* The guard decides whether a matched value is actually delivered and whether
- * it is scrubbed from results, so reporting the rules without it would answer
- * "what is configured" and miss "what will happen". */
-console.log(`READ GUARD (${winner[0]}): ${describeGuard(compileConfig(winner[1]).guard)}`)
-console.log(
-  'note: reads=deny refuses injection into env/printenv-style commands (built-in list ' +
-    'plus denyCommands); shells=off still delivers to a shell command line, redact=on is the fallback for that'
 )
 console.log(
   `note: terminal=${entryConfig.terminal} comes from the COMPOSITION entry ` +

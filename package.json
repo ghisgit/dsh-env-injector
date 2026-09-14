@@ -1,6 +1,6 @@
 {
   "name": "dsh-env-injector",
-  "version": "0.3.1",
+  "version": "0.2.0",
   "description": "DSH plugin: rule-driven, per-spawn environment injection (e.g. GH_TOKEN for gh/git) with hot-reloadable settings",
   "repository": {
     "type": "git",
@@ -27,8 +27,7 @@
     "src",
     "scripts",
     "cordis.patch.yml",
-    "README.md",
-    "README.zh.md"
+    "README.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

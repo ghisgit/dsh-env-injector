@@ -38,8 +38,6 @@ env-injector:
 | **变量未设置 ⇒ 不注入** | 规则里的 `envVar` 在 `process.env` 中缺失（或为空）时不注入任何东西，并只警告一次（点名变量）。 |
 | **只碰 subprocess 这一个 seam** | 服务实例上每个被包装的方法只加一个 own data property，卸载时还原：`spawn` 始终包裹，`terminal: true` 时额外包裹 `spawnTerminal`。`resolveExecutable` 及其余 seam 不动。 |
 | **规则是实时的** | 编辑 `$DSH_HOME/settings.yaml` 会为下一次 spawn 重新编译规则——不重启、不重载。 |
-| **读命令永远拿不到值**（guard） | 命令里含 `env`、`printenv` 或其它已配置的读取命令时，整条 spawn 被拒绝——返回调用方的原 spec 对象，等于什么都没加。在注入路径上强制，不需要任何额外服务。 |
-| **注入过的值会从结果里抹掉**（guard） | 一个 `tools/post-execute` 监听器把文本块里的值（含 base64/hex 形式）替换成 `[redacted:NAME]`。这是减害，不是保证——见「安全说明」。 |
 
 ## 安装
 
@@ -100,7 +98,6 @@ dsh web 2>&1 | grep '\[env-injector\]'              # 前台运行：它们写�
 # 或者：任何捕获 harness 进程 stdout/stderr 的地方
 # [env-injector] settings namespace 'env-injector' attached — 1 rule(s): ^gh(\.exe)?$ → GH_TOKEN
 # [env-injector] wrapping ctx.subprocess.spawn/spawnTerminal — 1 rule(s): ^gh(\.exe)?$ → GH_TOKEN (source: settings.yaml over the composition entry)
-# [env-injector] guard: reads=deny shells=off redact=on
 ```
 
 `wrapping …` 那行是权威的。它只在真正会被使用的来源解析完成之后才打印，并且在该来源
@@ -160,13 +157,6 @@ env-injector:
   overrideExisting: true             # 默认 true：harness 的值胜过 spec.env
   terminal: true                     # 默认 true：同时覆盖 spawnTerminal（PTY 会话）
   logMatches: false                  # 默认 false：记录每次命中（info）/未命中（debug）
-  guard:
-    reads: true                      # 默认 true：拒绝注入给 env/printenv 这类读取命令
-    shells: off                      # 默认 off：`bash -c '…'` 命令行仍会拿到值
-    redactOutput: true               # 默认 true：把注入过的值从工具结果里抹掉
-    marker: '[redacted:{name}]'      # 默认值：替换文本，{name} 为变量名
-    denyCommands: []                 # 默认 []：在内置读取命令表之外**追加**要拒绝的命令
-    denyCommandsOnly: false          # 默认 false：true 表示放弃内置表，只用 denyCommands
 ```
 
 `command` 与 `argsPattern` 是**正则源码字符串**，不是 `/…/` 字面量——settings 段必须
@@ -180,53 +170,6 @@ env-injector:
 `argsPattern` 对可执行文件之后的词做测试（以单空格连接），shell 命令行里的每条命令
 分别匹配。列表是整体替换（数组不合并），所以 `settings.yaml` 里的 `rules:` 就是完整
 列表。
-
-### 读防护：让值不进到模型手里
-
-注入一个值就等于创建了一个能把它打印出来的进程：harness 拉起的任何子进程都能
-`echo $GH_TOKEN`。两层机制让这件事变难，但两者都不是沙箱——请先看清强度再依赖。
-
-**A 层 — 拒绝读取命令（`guard.reads`，默认开）。** 命令行里出现「以读写环境变量为目的」
-的命令时，整条 spawn 不注入，无论它出现在命令位置、管道中的某一级，还是包装命令位置。
-
-```yaml
-env-injector:
-  guard:
-    reads: true
-    denyCommands: ['tee', 'xxd']   # **追加**的读取命令；内置表依然生效
-    denyCommandsOnly: false        # true 才放弃内置表（加载时会警告）
-```
-
-内置表：`env`、`printenv`、`set`、`export`、`declare`、`typeset`、`readonly`、
-`local`、`unset`、`compgen`，以及 PowerShell 的写法 `gci`、`Get-ChildItem`、
-`Get-Item`、`gi`（大小写不敏感，所以 Windows 的 `SET` 也覆盖）。`denyCommands` 只能
-**追加**——配置这个安全开关不可能顺手削弱它，所以写一个已在内置表里的名字只是冗余，
-而不是把它删掉的手段。`denyCommandsOnly: true` 是唯一刻意的退出方式，加载提示会点名
-列出因此失效的内置项。拒绝会从该 spawn 中扣下**所有**命中的值，而不只是撞上读取命令
-的那条规则——`gh pr list | env` 里两者在同一个进程树中，只拒绝一半等于没防。拒绝会
-记为 `guard: refused GH_TOKEN (rule 0) for: gh, env`，按（变量, 命令行）各报一次。
-
-**B 层 — 抹掉结果里的值（`guard.redactOutput`，默认开）。** 本插件注入过的每个值，在
-工具结果里都会被 `guard.marker`（`[redacted:GH_TOKEN]`）替换，包括其原文形式和一次
-base64/hex 编码后的形式（`base64 <<< "$TOKEN"`）。短于 8 字节的值不处理，避免短变量
-把每个结果都变成噪声。只有文本块被改写——JSON 结果的 `value` 与非文本块原样透传，
-所以下游解析不受影响。B 层需要工具注册表；没有注册表时插件会在加载提示里说明
-（`output redaction unavailable (no tools service mounted)`），A 层照常工作。
-
-**C 层 — 由你决定（`guard.shells`）。** harness 的 bash 工具总是以
-`bash -c '<命令行>'` 运行模型给的命令。默认 `shells: off` 下该命令行仍会拿到值，所以
-`bash -c 'git push'` 可用，`bash -c 'echo $GH_TOKEN'` 同样会拿到变量——B 层是值与该
-模型之间唯一的屏障。设为 `shells: model` 可以拒绝每一条调用方组合出来的命令行：
-
-```yaml
-env-injector:
-  guard:
-    shells: model           # 任何 shell 命令行都不再注入
-```
-
-在 `shells: model` 下，需要凭据的命令必须由插件直接以 `argv`（不经过 shell）拉起，
-因为模型自己的 `bash -c 'git push'` 不再会拿到 token。这就是诚实的取舍：`off` 方便，
-`model` 才是「模型读不到」真正需要的东西。
 
 ### 持久 shell 与 PTY 会话（`minimal` preset）
 
@@ -371,8 +314,6 @@ fiber 的 uid」来标记 fiber 的 epoch，所以当 `ctx.subprocess` 被重新
 | `>= 0.1.5-rc.1`（当前） | 使用 `ctx.settings.installSection()`：entry 作为 base 层，自动 attach/detach 来源，写入时 `validate`。 |
 | 更旧的 `@deepseek-ai/dsh-settings` | 自动回退到 `register()` + `watch()` + 一个销毁 effect（见 `src/index.ts`）。 |
 | 没有 settings provider | 从组合 entry 运行；每次规则编辑都需要重启（或改 patch 实时生效）。出厂的 entry 没有规则，所以你必须在那里添加。 |
-| 没有工具注册表 | 读防护的拒绝层不受影响（它在注入路径上）。输出打码不可用，加载提示会说明。 |
-| 工具注册表按 DSH 的方式挂载 | 打码监听器注册在**注入 context** 上（`ctx.inject(['tools'], (toolsCtx) => toolsCtx.on('tools/post-execute', …))`），因为 cordis 的**服务实例不是事件发射器**：`ctx.get('tools')` 返回的 `ToolRuntime` 根本没有 `on`。这一点是针对真实 `@deepseek-ai/dsh-tools` 注册表验证的，不只是单测假件。 |
 | 没有 `ctx.subprocess`（早期无此 seam 的 DSH） | 插件完全不激活——`inject: ['subprocess']` 永不满足，所以什么都不打补丁、也不会失败。 |
 
 回退路径是运行时特性探测，而不是嗅探版本号：
@@ -418,42 +359,33 @@ gh auth setup-git          # 写入 credential.https://github.com.helper = !gh a
 
 * **值永不进日志。** 每条提示只写变量名、规则下标和命令行，绝不写内容。
   `logMatches` 写的是 `injected GH_TOKEN for: …`，不是 token。
-* **`process.env` 从不被写入**，spec 构造完成后也不保留值：打码运行时按名字现读变量。
-* **被拒绝的 spawn 保留调用方原 spec 对象**，所以 guard 无法改变获准 spawn 的执行内容。
+* **`process.env` 从不被写入**，注入的条目只活在一次 spawn 的那一个 spec 对象里。
 * **默认 `overrideExisting: true`**，模型提供的 `env` 无法伪造成 harness 拥有的变量。
   设为 `false` 可让显式的调用方值胜出。
 * **注入按设计胜过 harness 的清洗**：它就是可信调用方会使用的那层显式 `env`。清洗继续
   保护其他所有变量和所有未命中的命令。
-* **`denyCommands` 只能追加拒绝项。** 内置读取命令表是地板，不是会被配置替换掉的默认
-  值；`denyCommandsOnly: true` 是唯一刻意的退出方式，加载提示会点名因此失效的项。
 
-### 读防护挡不住什么（默认 `reads: true` + `shells: off`）
+### 注入**不能**给你什么保护
 
-* `bash -c 'echo $GH_TOKEN'` 仍会拿到变量——模型的 shell 命令行与别的命令一样被注入，
-  只有输出打码挡在值和模型之间。`guard.shells: model` 能拒绝它，代价是
-  `bash -c 'git push'` 也不再可用。
-* **打码是字面量匹配，它不认识的变化形式会穿过去。** 本仓库实测确认：双重 base64、
-  大写 hex、逐字符插空格的值都会原样送达。只覆盖一次 base64/hex。
-* **短于 8 字节的值永不脱敏**（否则 4 位 PIN 会重写无关结果）。短凭据会以明文传输；
-  见「限制」一节。
-* **只有文本块被改写。** JSON 结果的 `value` 与任何非文本块按引用透传，所以工具以结构化
-  数据形式给出的密钥不会被抹掉。
-* **值一旦轮换就立刻失去保护。** 打码读的是变量的*当前*值，所以拿到旧值的 spawn 在结果
-  被抹除之前若发生轮换，旧值就留在明文中。长期会话（PTY、后台 job 稍后的输出）最容易踩。
+本插件没有读防护：它承诺的是*送达*，不是*围堵*。注入出去的值，就是子进程手里的值。
+
+* 命中的命令——**以及它派生的一切**——都能读到注入值。`env`、`printenv`、
+  `bash -c 'echo $GH_TOKEN'` 与别的命令一样会拿到它，而结果返回模型之前没有任何环节会
+  改写它，所以对变量的一次 echo 就是一次泄漏。
 * 拿到值的命令可以**不打印**就泄漏：写进文件、喂给 hook 或另一个程序、通过网络发出。
   `git push` 会执行 `.git/hooks/*`，而拥有 workspace 写权限的模型可以自己写一个。
   任何环境变量层的防护都看不到这些。
-* 读取命令表是对命令名的启发式，不是边界。`cat /proc/self/environ`、某语言运行时的
-  `os.environ`、模型自己写的脚本，按构造都在其触及范围之外；它存在的意义是让插件不会把
-  值*交到*一个明显的读取者手里。
-* 所以它是*带清晰审计线索的减害*，不是隔离。真正的隔离需要独立 OS 用户、容器或凭据
-  代理——超出「环境变量注入插件」的范围。
+* 长期会话是暴露面最大的一种：PTY（`spawnTerminal`）在整个会话存活期间都持有该变量，
+  后台 job 则在 job 存活期间持有。
+* 运行时拼出来的命令行（`bash -c "$CMD"`）照样会被匹配——shell 无论如何都会被解开——
+  但这也意味着决定「拿这个变量跑什么」的是*调用方*的命令行，而不是你写的规则。
 
 ### 实践中的最小面
 
-规则要窄（`^git(\.exe)?$` 配 `argsPattern`，而不是 `.*`）、`guard.reads: true`、一个
-模型无法用来撰写「被注入命令将要执行的东西」的 workspace；而当 token 必须完全不可读时，
-用 `guard.shells: model`，并把凭据换成**不是环境变量**的形态。
+规则要窄：`^git(\.exe)?$` 配 `argsPattern`，而不是 `.*`，这样 `git status` 永远不会带上
+token。优先使用短时效、低权限的凭据（细粒度 token 而不是经典 token）。当 token 必须
+完全不可读时，不要把它作为环境变量交出去——用 credential helper、agent socket 或把密钥
+留在子进程之外的代理。
 
 ## 限制
 
@@ -465,10 +397,6 @@ gh auth setup-git          # 写入 credential.https://github.com.helper = !gh a
 * 包装命令之后的裸数字操作数会被跳过（`nice -n 5 gh`），但规则不会针对包装命令自身的
   参数求值。
 * 规则数组是整体替换；没有按规则合并，也没有稳定的规则 id。
-* 打码忽略短于 8 字节的值——短凭据因此完全没有输出保护；如果某个值本身就是常见词，它
-  会在此值出现的任何地方被打码。guard 不打算在这两种情况下自作聪明；请优先使用长且高
-  熵的值。
-* 打码只覆盖一次编码（base64、hex）且只覆盖文本块；不认识的变化形式见「安全说明」。
 * 规则正则是在编译配置时校验的，不是由 schema 校验，所以 `settings.yaml` 里的坏模式会在
   读取时被拒绝、上一份规则继续生效——该 spawn 保持旧行为，而不是静默失去注入。
 
@@ -477,23 +405,21 @@ gh auth setup-git          # 写入 credential.https://github.com.helper = !gh a
 ```bash
 pnpm install                    # 如果你的镜像缺 rc 构建，加 --registry=https://registry.npmjs.org/
 pnpm build                      # tsc → lib/（已提交：loader 导入的是 lib/index.js）
-pnpm test                       # 85 个测试：匹配、注入、guard、打码、实时 settings、回退、打包
-pnpm resolve-rules              # 当前真正生效的规则 AND guard 状态
-pnpm acceptance                 # 真实 seam：真实子进程、真实工具注册表、真实 settings.yaml
+pnpm test                       # 60 个测试：匹配、注入、实时 settings、旧 provider 回退、打包
+pnpm resolve-rules              # 当前真正生效的规则
+pnpm acceptance                 # 真实 seam：真实子进程、真实 settings.yaml
 ```
 
 | 文件 | 作用 |
 |---|---|
-| `src/index.ts` | 整个插件：schema、规则编译、argv 分析、spawn 包装、guard 强制、打码监听器、settings 接线。 |
-| `src/tools.ts` | 可选工具注册表 seam 的结构化声明：本包不 import 任何 `@deepseek-ai/dsh-tools` 类型，所以打码不会给使用者增加 peer 依赖。 |
+| `src/index.ts` | 整个插件：schema、规则编译、argv 分析、spawn 包装、settings 接线。 |
 | `lib/index.js` | 构建产物——`dsh` 实际导入的东西（唯一的运行时 import：`@deepseek-ai/schemastery`）。 |
 | `cordis.patch.yml` | bundle 层：一个 `insert` 行，其组合 entry 携带空的 `rules:` 列表（注释里的示例规则是文档化的起点，不是默认值）。 |
-| `scripts/resolve-rules.mjs` | 离线探针：手工叠加 defaults → composition entry → `settings.yaml`，打印真正生效的规则 AND guard，因为 `--dump-config` 看不到 settings 层。 |
-| `scripts/acceptance.mjs` | 单测做不到、因为它需要部署真实包的检查：真实子进程拿到真实 token、guard 拒绝 `env`/`printenv`、真实 `postExecute` waterfall 打码结果、`settings.yaml` 编辑实时改写规则。已针对 DSH `0.1.5-rc.1` 验证。 |
+| `scripts/resolve-rules.mjs` | 离线探针：手工叠加 defaults → composition entry → `settings.yaml`，打印真正生效的规则，因为 `--dump-config` 看不到 settings 层。 |
+| `scripts/acceptance.mjs` | 单测做不到、因为它需要部署真实包的检查：真实子进程通过真实 `ctx.subprocess` 服务拿到真实 token，`settings.yaml` 编辑实时改写规则。已针对 DSH `0.1.5-rc.1` 验证。 |
 | `test/match.test.mjs` | 纯匹配/注入单测，含「直通即原对象」的同一性保证。 |
-| `test/guard.test.mjs` | 读防护：读取命令拒绝（作为命令、管道级、包装命令三种形态）、`shells` 策略、打码契约（原文/base64/hex、短值、非文本块）。 |
 | `test/sandbox.test.mjs` | 真实沙箱 provider + 真实 subprocess provider：断言受限 argv 形状，以及注入能穿过它。 |
-| `test/e2e.test.mjs` | 真实 `dsh-subprocess-local` + 真实 `dsh-settings-file`：真实 `bash` 子进程打印自己的环境、真实 `settings.yaml` 编辑实时改写规则、guard 拦截真实 `env` spawn、打码监听器抹掉真实注入的值。 |
+| `test/e2e.test.mjs` | 真实 `dsh-subprocess-local` + 真实 `dsh-settings-file`：真实 `bash` 子进程打印自己的环境、真实 `settings.yaml` 编辑实时改写规则，旧 provider 回退在真实服务上（去掉 `installSection`）跑通。 |
 | `test/packaging.test.mjs` | 安装相关的声明：bundle patch、发布路径、profile 形状的解析与 `unwrapExports`。 |
 
 ## 致谢
