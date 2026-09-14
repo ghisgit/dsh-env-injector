@@ -80,3 +80,23 @@
         # Turn on to log every match (`info`) and miss (`debug`) through the
         # `env-injector` logger.
         logMatches: false
+        # The read guard: keep an injected value out of the model's reach. Both
+        # layers are on by default and neither is a sandbox — the README's
+        # "read guard" section states exactly what they do and do not stop.
+        #
+        #   reads: true        refuse injection into env/printenv-style commands
+        #                      (the built-in list; a non-empty `denyCommands`
+        #                      REPLACES it rather than extending it)
+        #   shells: model      also refuse every caller-composed `bash -c '…'`
+        #                      command line. The default `off` keeps
+        #                      `bash -c 'git push'` working, and is also why
+        #                      `bash -c 'echo $GH_TOKEN'` still receives the
+        #                      value; `model` is what "the model cannot read it"
+        #                      actually requires.
+        #   redactOutput: true replace injected values (raw, base64, hex) with
+        #                      `marker` in tool results, when a tool registry is
+        #                      mounted
+        guard:
+          reads: true
+          shells: off
+          redactOutput: true

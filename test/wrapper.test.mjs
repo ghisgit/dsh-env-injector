@@ -8,13 +8,16 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { compileConfig, installSpawnInjection } from '../lib/index.js'
+import { Config, compileConfig, installSpawnInjection } from '../lib/index.js'
 
 /** A logger that goes nowhere; the installer also writes notices to stderr. */
 const silentLogger = { info() {}, warn() {}, debug() {}, error() {} }
 
 /** Written records of what the stub provider received. */
-const compiled = (rules) => compileConfig({ rules, overrideExisting: true, terminal: true, logMatches: false })
+const compiled = (rules, guard) => compileConfig({ rules, overrideExisting: true, terminal: true, logMatches: false, ...(guard === undefined ? {} : { guard }) })
+
+/** The guard block as a resolved section: any subset, schema defaults for the rest. */
+const guard = (overrides) => Config({ guard: overrides }).guard
 
 /** A runtime shaped like a real provider: prototype methods, own-property patch. */
 class StubRuntime {
@@ -32,6 +35,22 @@ class StubRuntime {
 }
 
 process.env.WRAP_TOKEN = 'wrapper-value'
+
+/** Capture what the installer writes to stderr (its operator-channel notices). */
+function captureStderr(run) {
+  const original = process.stderr.write
+  const lines = []
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk))
+    return true
+  }
+  try {
+    run()
+  } finally {
+    process.stderr.write = original
+  }
+  return lines.join('')
+}
 
 const GH_ON_SHELL = [
   { command: '^bash$', argsPattern: '', envVar: 'WRAP_TOKEN', enabled: true, flags: '' },
@@ -107,4 +126,51 @@ test('a reference captured before teardown passes arguments through', () => {
   runtime.spawn(spec)
   assert.equal(runtime.calls.at(-1).spec, spec)
   assert.equal(typeof captured, 'function')
+})
+
+/* ── The read guard at the seam ─────────────────────────────────────────────── */
+
+const ENV_RULE = [{ command: '^env$', argsPattern: '', envVar: 'WRAP_TOKEN', enabled: true, flags: '' }]
+
+test('the guard withholds a matched value and hands over the very same spec', () => {
+  const runtime = new StubRuntime()
+  const spec = { argv: ['env'], cwd: '/workspace', env: { KEEP: '1' } }
+  const dispose = installSpawnInjection(runtime, ['spawn'], () => compiled(ENV_RULE), silentLogger)
+  const stderr = captureStderr(() => runtime.spawn(spec))
+  assert.equal(runtime.calls.at(-1).spec, spec, 'a refused spawn keeps the caller’s object identity')
+  assert.deepEqual(spec.env, { KEEP: '1' }, 'nothing was added')
+  assert.match(stderr, /guard: refused WRAP_TOKEN \(rule 0\) for: env/)
+  dispose()
+})
+
+test('a refusal is reported once, even when a tool runner retries', () => {
+  const runtime = new StubRuntime()
+  const dispose = installSpawnInjection(runtime, ['spawn'], () => compiled(ENV_RULE), silentLogger)
+  const stderr = captureStderr(() => {
+    runtime.spawn({ argv: ['env'], cwd: '/workspace', env: {} })
+    runtime.spawn({ argv: ['env'], cwd: '/workspace', env: {} })
+  })
+  assert.equal(stderr.match(/guard: refused/g)?.length, 1, 'the retry does not repeat the notice')
+  dispose()
+})
+
+test('turning the read guard off restores delivery', () => {
+  const runtime = new StubRuntime()
+  const rules = [{ command: '^env$', argsPattern: '', envVar: 'WRAP_TOKEN', enabled: true, flags: '' }]
+  const dispose = installSpawnInjection(runtime, ['spawn'], () => compiled(rules, guard({ reads: false })), silentLogger)
+  const spec = { argv: ['env'], cwd: '/workspace', env: {} }
+  runtime.spawn(spec)
+  assert.equal(runtime.calls.at(-1).spec.env.WRAP_TOKEN, 'wrapper-value', 'reads=false is the documented opt-out')
+  assert.notEqual(runtime.calls.at(-1).spec, spec, 'and the spec is rewritten again')
+  dispose()
+})
+
+test('a combined shell flag is unwrapped like a plain `-c`', async () => {
+  /* `bash -lc '…'` is a documented POSIX invocation and must not read as an
+   * opaque argv: the rule (and the guard) have to see what it will run. */
+  const runtime = new StubRuntime()
+  const dispose = installSpawnInjection(runtime, ['spawn', 'spawnTerminal'], () => compiled(GH_ON_SHELL), silentLogger)
+  await runtime.spawnTerminal({ argv: ['bash', '-lc', 'gh pr list'], cwd: '/workspace', env: {}, rows: 24, cols: 80, graceMs: 3000 })
+  assert.equal(runtime.calls.at(-1).spec.env.WRAP_TOKEN, 'wrapper-value', 'the inner gh matched through -lc')
+  dispose()
 })

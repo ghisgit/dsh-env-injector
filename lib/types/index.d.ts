@@ -36,6 +36,12 @@
  *   composition entry (`cordis.patch.yml`), then the user's `settings.yaml`
  *   section, and a committed change swaps the compiled rule set for the next
  *   spawn without a restart.
+ * - **The read guard is a separate, weaker promise.** Injecting a value creates
+ *   a process that can print it, so two guards exist: `guard.reads` refuses
+ *   injection into the commands whose purpose is reading the environment
+ *   (`env`, `printenv`, …), and `guard.redactOutput` rewrites injected values
+ *   out of tool results. Neither is a sandbox — see the README's security notes
+ *   for what they do not stop.
  *
  * The plugin deliberately does not wrap `spawnTerminal` (interactive PTY
  * sessions are not the credentialed batch commands this exists for), does not
@@ -46,6 +52,7 @@
 import type { Context } from '@deepseek-ai/cordis';
 import type { Logger } from '@deepseek-ai/cordis';
 import z from '@deepseek-ai/schemastery';
+import type { ToolResultBlock, ToolDecision, ToolResultLike } from './tools.js';
 /** Plugin name shown by the loader and used for this plugin's logger. */
 export declare const name = "env-injector";
 /**
@@ -106,6 +113,66 @@ export interface EnvInjectorRule {
     /** Regex flags for both patterns (e.g. `i`). Must be valid `RegExp` flags. */
     flags: string;
 }
+/** Whether a prompt-composed shell command line may receive injected values. */
+export type GuardShellPolicy = 'off' | 'model';
+/**
+ * The resolved `guard` section: what this plugin refuses to do with a value it
+ * holds, and whether that value is scrubbed from tool results.
+ */
+export interface GuardConfig {
+    /**
+     * Refuse injection into guard-specific read commands. `true` (the default)
+     * keeps THIS plugin from being the thing that hands a credential to `env`,
+     * `printenv` and friends.
+     */
+    reads: boolean;
+    /**
+     * Whether a shell command line the model composed (`bash -c '…'`, the shape
+     * `dsh-bash-tool` always produces, sandbox wrapping included) may still
+     * receive values.
+     *
+     * `'off'` (the default) keeps today's behaviour: `bash -c 'git push'` gets
+     * the token, and so does `bash -c 'echo $GH_TOKEN'` — which is only mitigated
+     * by {@link GuardConfig.redactOutput}, never prevented. `'model'` refuses
+     * injection whenever the spawn's argv is a shell carrying a command line, so
+     * a value can never reach a process whose command line the caller composed.
+     */
+    shells: GuardShellPolicy;
+    /**
+     * Replace injected values found in tool results with {@link GuardConfig.marker}.
+     * This is harm reduction, not a guarantee: an encoded, split or relayed value
+     * can still reach the model (see the README's security notes).
+     */
+    redactOutput: boolean;
+    /** Replacement text; `{name}` is substituted with the variable's name. */
+    marker: string;
+    /**
+     * Read commands to refuse, replacing {@link DEFAULT_READ_COMMANDS} when
+     * non-empty. Matched case-insensitively against an invocation's command name
+     * (and its full path), so `env` covers `/usr/bin/env`.
+     */
+    denyCommands: string[];
+}
+/**
+ * Commands that exist to read or rewrite the environment, refused by default
+ * as injection targets ({@link GuardConfig.reads}).
+ *
+ * The list is deliberately limited to commands whose *purpose* is the
+ * environment — a heuristic, not a boundary — so that narrowing a rule set
+ * stays the real control. It is matched case-insensitively, which is what makes
+ * the Windows spellings (`SET`, `Get-ChildItem Env:`) covered too.
+ */
+export declare const DEFAULT_READ_COMMANDS: readonly string[];
+/** Accepted input for the `guard` section: every field has a default. */
+export interface GuardConfigInput {
+    reads?: boolean;
+    shells?: GuardShellPolicy;
+    redactOutput?: boolean;
+    marker?: string;
+    denyCommands?: string[];
+}
+/** Schemastery schema of the `guard` section. */
+export declare const GuardSchema: z<GuardConfigInput, GuardConfig>;
 /** The resolved `env-injector` section. */
 export interface EnvInjectorConfig {
     /** Ordered rule list; every matching rule contributes its variable. */
@@ -130,6 +197,8 @@ export interface EnvInjectorConfig {
     terminal: boolean;
     /** Log every match/miss (info/debug). Off by default to keep spawns quiet. */
     logMatches: boolean;
+    /** Refuse the read paths that would hand an injected value back to the model. */
+    guard: GuardConfig;
 }
 /**
  * Accepted input for one rule: the fields the schema draws defaults for are
@@ -148,6 +217,7 @@ export interface EnvInjectorConfigInput {
     overrideExisting?: boolean;
     terminal?: boolean;
     logMatches?: boolean;
+    guard?: GuardConfigInput;
 }
 /** Schemastery schema of one rule. */
 export declare const RuleSchema: z<EnvInjectorRuleInput, EnvInjectorRule>;
@@ -172,11 +242,21 @@ export interface CompiledRule {
     readonly argsPattern: RegExp | undefined;
     readonly envVar: string;
 }
+/** The compiled form of a {@link GuardConfig}: the read-command set pre-lowercased. */
+export interface CompiledGuard {
+    readonly reads: boolean;
+    readonly shells: GuardShellPolicy;
+    readonly redactOutput: boolean;
+    readonly marker: string;
+    /** Lower-cased command names refused as injection targets. */
+    readonly deny: ReadonlySet<string>;
+}
 /** The compiled form of a whole {@link EnvInjectorConfig}. */
 export interface CompiledConfig {
     readonly rules: readonly CompiledRule[];
     readonly overrideExisting: boolean;
     readonly logMatches: boolean;
+    readonly guard: CompiledGuard;
 }
 /**
  * Compile one rule's regex sources, naming the offending field in the error.
@@ -187,7 +267,20 @@ export interface CompiledConfig {
  */
 export declare function compileRule(rule: EnvInjectorRule, index: number): CompiledRule;
 /**
+ * Compile a resolved guard section: lower-case the refused command names so
+ * matching is case-insensitive on every platform.
+ * @param guard - the resolved `guard` section.
+ * @returns its matching form.
+ */
+export declare function compileGuard(guard: GuardConfig): CompiledGuard;
+/**
  * Compile a resolved config into its matching form, dropping disabled rules.
+ *
+ * A caller that builds an {@link EnvInjectorConfig} by hand may omit `guard`
+ * (tests do, and so would any embedder); an absent guard compiles to the schema
+ * defaults rather than throwing, so injection keeps working while the guard
+ * falls back to its safe default.
+ *
  * @param config - the resolved `env-injector` section.
  * @returns the compiled rules plus the matching-time options.
  * @throws {Error} when any enabled rule holds an invalid regex.
@@ -226,8 +319,36 @@ export declare function executableName(word: string): string;
  *
  * @param argv - the spawn spec's argv.
  * @returns the invocations found, in command-line order; possibly empty.
+ * @see analyseSpawn for the same extraction plus the shell-carried fact.
  */
 export declare function extractInvocations(argv: readonly string[]): Invocation[];
+/** What one spawn's argv resolves to: the commands, the wrappers, and how they got there. */
+export interface SpawnAnalysis {
+    /** The commands the spawn runs, in command-line order; what the rules match. */
+    readonly invocations: Invocation[];
+    /**
+     * Wrapper commands skipped to reach them (`env`, `sudo`, `nohup`, …). Rules
+     * never see these, but they run the inner command as a child — and therefore
+     * share its environment — so the guard must judge them.
+     */
+    readonly wrappers: Invocation[];
+    /** Whether a shell carried the command line (a caller-composed command line). */
+    readonly viaShell: boolean;
+}
+/**
+ * Extract a spawn's commands AND report how they are reached.
+ *
+ * {@link extractInvocations} is the matching view; this is the guard's view. The
+ * difference matters because the harness shell tools never spawn the model's
+ * command directly — `dsh-bash-local` builds `['bash','-c',<command line>]` and
+ * the sandbox wraps that behind its own profile arguments — so "did a shell
+ * carry this command line" is exactly "did the caller compose the command line
+ * this process will run", which is what {@link GuardConfig.shells} governs.
+ *
+ * @param argv - the spawn spec's argv.
+ * @returns the invocations, wrappers, and whether a shell carried the command line.
+ */
+export declare function analyseSpawn(argv: readonly string[]): SpawnAnalysis;
 /**
  * Select every compiled rule that matches any of a spawn's commands.
  * @param invocations - the commands found in the spawn's argv.
@@ -244,7 +365,19 @@ export interface InjectionResult<T extends EnvBearingSpec = EnvBearingSpec> {
     /** Rules that matched but had no usable source value. */
     readonly skipped: readonly {
         readonly envVar: string;
-        readonly reason: 'unset' | 'caller';
+        readonly reason: 'unset' | 'caller' | 'guard';
+    }[];
+    /**
+     * Rules whose value was withheld because the spawn is a read channel
+     * ({@link GuardConfig.reads}) or a caller-composed shell command line
+     * ({@link GuardConfig.shells}). Diagnostics only — the spec stays untouched.
+     */
+    readonly blocked: readonly {
+        readonly envVar: string;
+        readonly rule: number;
+        readonly command: string;
+        /** Why the guard refused, e.g. `env reads or rewrites the environment`. */
+        readonly reason: string;
     }[];
 }
 /**
@@ -269,9 +402,9 @@ export type InjectionWarning = (envVar: string, message: string) => void;
  *
  * The input spec is never mutated: on a successful match the result is a new
  * object whose `env` is `{ ...spec.env, [envVar]: value }`. When nothing
- * matches, or the source variable is unset/empty, the ORIGINAL spec object is
- * returned, so an unaffected request behaves exactly as it would without this
- * plugin installed.
+ * matches, the source variable is unset/empty, or the guard refuses the spawn,
+ * the ORIGINAL spec object is returned, so an unaffected request behaves exactly
+ * as it would without this plugin installed.
  *
  * @param spec - the caller's spec.
  * @param compiled - the current compiled rules and matching options.
@@ -279,6 +412,77 @@ export type InjectionWarning = (envVar: string, message: string) => void;
  * @returns the spec to spawn with, plus what happened.
  */
 export declare function injectEnvForSpec<T extends EnvBearingSpec>(spec: T, compiled: CompiledConfig, warn?: InjectionWarning): InjectionResult<T>;
+/** How a redaction pair's text relates to the variable's value. */
+export type RedactionForm = 'raw' | 'base64' | 'hex';
+/** One literal to replace, and the variable name the replacement names. */
+export interface RedactionPair {
+    /** The literal text that may appear in a result. */
+    readonly text: string;
+    /** How {@link RedactionPair.text} encodes the variable's value. */
+    readonly form: RedactionForm;
+    /** The variable the literal came from, used for the marker. */
+    readonly envVar: string;
+    /** The value's byte length, so ordering is by the underlying secret. */
+    readonly bytes: number;
+}
+/**
+ * Build the literals to redact for the given variables: the value as-is, plus
+ * the base64 and hex encodings that one shell pipeline would produce
+ * (`base64 <<< "$TOKEN"`, `xxd -p`).
+ *
+ * The value is read from `process.env` HERE and never retained: pairs are
+ * rebuilt per redaction, so a rotated variable is redacted at its current
+ * value and this plugin holds no copy of a credential between calls.
+ *
+ * @param envVars - the variable names that were injected, in injection order.
+ * @param env - the environment to read from (defaults to `process.env`).
+ * @returns the pairs, longest secret first so a shared prefix cannot shadow a
+ *   longer match; empty when every value is unset, empty, or too short.
+ */
+export declare function redactionPairs(envVars: Iterable<string>, env?: Record<string, string | undefined>): RedactionPair[];
+/**
+ * Replace every injected value in one text block.
+ *
+ * The marker's own literal is replaced first (with itself, as it must already
+ * be redacted) so a secret containing the marker text cannot turn the marker
+ * into a different string. A hit is only accepted when the literal actually
+ * decodes back to a known value, which keeps a coincidental hex-looking word
+ * from being masked.
+ *
+ * @param text - the model-facing text.
+ * @param pairs - the literals to replace, from {@link redactionPairs}.
+ * @param marker - the replacement, with `{name}` substituted.
+ * @returns the redacted text, or the ORIGINAL string when nothing matched.
+ */
+export declare function redactValues(text: string, pairs: readonly RedactionPair[], marker: string): string;
+/**
+ * Apply {@link redactValues} to every text block of a result projection.
+ *
+ * Only `text` blocks are rewritten: a JSON result's `value`, a `thinking` block
+ * and any non-text block are returned by reference, so redaction cannot change
+ * what a downstream tool parses or how a stored transcript replays.
+ *
+ * @param blocks - the content blocks of a tool result.
+ * @param pairs - the literals to replace.
+ * @param marker - the replacement, with `{name}` substituted.
+ * @returns replacement blocks, or `undefined` when nothing matched.
+ */
+export declare function redactBlocks<T extends ToolResultBlock>(blocks: readonly T[], pairs: readonly RedactionPair[], marker: string): T[] | undefined;
+/**
+ * Build the `tools/post-execute` listener that redacts injected values.
+ *
+ * Extracted from the plugin body so the redaction contract is testable without
+ * a tool registry: the listener delegates with `next()` first (so a tool-owned
+ * projection runs before redaction), returns the decision untouched unless it
+ * accepted a content projection, and never touches `value` or `block`
+ * decisions.
+ *
+ * @param read - thunk returning the current compiled config, read per call so a
+ *   live settings change takes effect immediately.
+ * @param injected - thunk returning the names this installation has injected.
+ * @returns the listener to register on `tools/post-execute`.
+ */
+export declare function makeRedactionListener(read: () => CompiledConfig, injected: () => Iterable<string>): (exec: unknown, result: ToolResultLike, next: () => Promise<ToolDecision>) => Promise<ToolDecision>;
 /** The methods this plugin can wrap, in installation order. */
 export declare const WRAPPED_METHODS: readonly ["spawn", "spawnTerminal"];
 /** One of {@link WRAPPED_METHODS}. */
@@ -309,11 +513,20 @@ export declare function subprocessRuntime(view: unknown): Record<PropertyKey, un
  * @param methods - the method names to wrap (`spawn`, and `spawnTerminal` when terminal sessions are covered).
  * @param read - thunk returning the current compiled rules.
  * @param log - this plugin's logger.
+ * @param onInjected - called with the names a spawn actually received, so the
+ *   caller can track which variables exist to redact from tool results.
  * @returns the disposer restoring the original methods.
  * @throws {TypeError} when a method cannot be patched.
  * @throws {Error} when this runtime already carries the patch.
  */
-export declare function installSpawnInjection(runtime: Record<PropertyKey, unknown>, methods: readonly WrappedMethod[], read: () => CompiledConfig, log: Logger): () => void;
+export declare function installSpawnInjection(runtime: Record<PropertyKey, unknown>, methods: readonly WrappedMethod[], read: () => CompiledConfig, log: Logger, onInjected?: (envVars: readonly string[]) => void): () => void;
+/**
+ * One-line summary of the read guard, so a deployment log answers "is the
+ * guard on, and how strict is it?" without reading the config back.
+ * @param guard - the compiled guard.
+ * @returns its human-readable state.
+ */
+export declare function describeGuard(guard: CompiledGuard): string;
 /**
  * Load the plugin: resolve the rule source, keep it current through
  * `ctx.settings`, and wrap `ctx.subprocess.spawn` for the plugin's lifetime.

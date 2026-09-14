@@ -223,7 +223,13 @@ test('a spec with a malformed argv is passed through untouched', () => {
 
 test('the schema resolves defaults and stays JSON-shaped', () => {
   const resolved = Config({})
-  assert.deepEqual(resolved, { rules: [], overrideExisting: true, terminal: true, logMatches: false })
+  assert.deepEqual(resolved, {
+    rules: [],
+    overrideExisting: true,
+    terminal: true,
+    logMatches: false,
+    guard: { reads: true, shells: 'off', redactOutput: true, marker: '[redacted:{name}]', denyCommands: [] },
+  })
   assert.deepEqual(structuredClone(resolved), resolved, 'the resolved section survives a JSON round trip')
   assert.deepEqual(Config({ overrideExisting: false }).rules, [], 'omitting `rules` resolves to an empty list')
   const withRules = Config({ rules: GH_GIT_RULES })

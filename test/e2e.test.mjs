@@ -305,3 +305,106 @@ test('the older-provider fallback (register + watch) works on the real service',
     await fallbackCtx.fiber.dispose()
   }
 })
+
+/* ── The read guard over the real seams ─────────────────────────────────────── */
+
+/**
+ * Boot one isolated context with the real providers and return a runner plus a
+ * disposer. The guard tests need their own context because the suite's shared
+ * plugin is unloaded by the teardown test above.
+ * @param config - the plugin's composition entry.
+ * @param extra - called after the plugin is loaded, for optional services.
+ * @returns the command runner, the subprocess service, and a disposer.
+ */
+async function bootGuarded(config, extra) {
+  const bare = new Context()
+  await bare.plugin(asPlugin(subprocessProvider), {})
+  if (extra !== undefined) await extra(bare)
+  await bare.plugin(asPlugin(injectorModule), config)
+  return {
+    run: async (command) => {
+      const handle = bare.subprocess.spawn({
+        argv: ['bash', '-c', command],
+        cwd: process.cwd(),
+        stdio: { stdin: 'ignore', stdout: { maxBytes: 64 * 1024 }, stderr: { maxBytes: 64 * 1024 } },
+        graceMs: 5_000,
+      })
+      await handle.done
+      return `${handle.collected.stdout.readFrom(0).text}${handle.collected.stderr.readFrom(0).text}`
+    },
+    dispose: () => bare.fiber.dispose(),
+  }
+}
+
+test('the read guard stops a real child from being handed the token', async () => {
+  const { run, dispose } = await bootGuarded({
+    rules: [
+      ...COMPOSITION_RULES,
+      { command: '^env$', argsPattern: '', envVar: 'GH_TOKEN', enabled: true, flags: '' },
+    ],
+  })
+  try {
+    assert.equal(await run('env | grep -c "^GH_TOKEN="'), '0\n', 'no env spawn receives the token')
+    assert.equal(await run('gh --version >/dev/null 2>&1; env | grep -c "^GH_TOKEN="'), '0\n', 'and a gh spawn that pipes into env is refused with it')
+    assert.equal(await run('gh --version >/dev/null 2>&1; printf "token=[%s]" "$GH_TOKEN"'), `token=[${TOKEN}]`, 'a plain gh spawn still works')
+    assert.equal(await run('git -C /tmp --no-pager fetch >/dev/null 2>&1; printf "token=[%s]" "$GH_TOKEN"'), `token=[${TOKEN}]`, 'and so does the git rule')
+  } finally {
+    await dispose()
+  }
+})
+
+test('the redaction hook scrubs an injected value out of a tool result', async () => {
+  /* A minimal stand-in for the tool registry: the plugin resolves `tools` as an
+   * optional service and registers one `tools/post-execute` listener, which is
+   * the whole contract the redaction layer depends on. */
+  const listeners = new Map()
+  const fakeTools = {
+    name: 'tools',
+    apply(fakeCtx) {
+      fakeCtx.provide('tools', { on: (event, listener) => listeners.set(event, listener) })
+    },
+  }
+  const { run, dispose } = await bootGuarded({ rules: COMPOSITION_RULES }, async (bare) => {
+    await bare.plugin(fakeTools, {})
+  })
+  try {
+    assert.equal(listeners.has('tools/post-execute'), true, 'the plugin attached its redaction listener')
+    /* A real spawn first, so the plugin knows which variables are in play. */
+    assert.equal(await run('gh --version >/dev/null 2>&1; printf "token=[%s]" "$GH_TOKEN"'), `token=[${TOKEN}]`)
+    const listener = listeners.get('tools/post-execute')
+    const decision = await listener({ name: 'bash' }, {}, async () => ({
+      kind: 'accept',
+      content: [{ type: 'text', text: `$ env | grep GH_TOKEN\nGH_TOKEN=${TOKEN}\n` }],
+    }))
+    assert.equal(decision.content[0].text, '$ env | grep GH_TOKEN\nGH_TOKEN=[redacted:GH_TOKEN]\n', 'the leak is replaced with the marker')
+    assert.equal(JSON.stringify(decision).includes(TOKEN), false, 'and the raw value is gone from the projection')
+  } finally {
+    await dispose()
+  }
+})
+
+test('without a tools service the guard still refuses, and says redaction is unavailable', async () => {
+  const original = process.stderr.write
+  const lines = []
+  process.stderr.write = (chunk) => {
+    lines.push(String(chunk))
+    return true
+  }
+  let booted
+  try {
+    booted = await bootGuarded({ rules: [...COMPOSITION_RULES, { command: '^env$', argsPattern: '', envVar: 'GH_TOKEN', enabled: true, flags: '' }] })
+    /* The load notices are emitted from a `setTimeout(…, 0)`, so let the
+     * event loop turn before judging what was written. */
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0)
+    })
+  } finally {
+    process.stderr.write = original
+  }
+  try {
+    assert.match(lines.join(''), /guard: reads=deny shells=off redact=on — output redaction unavailable \(no tools service mounted\)/)
+    assert.equal(await booted.run('env | grep -c "^GH_TOKEN="'), '0\n', 'the denial layer needs no tools service')
+  } finally {
+    await booted.dispose()
+  }
+})

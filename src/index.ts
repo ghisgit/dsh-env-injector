@@ -36,6 +36,12 @@
  *   composition entry (`cordis.patch.yml`), then the user's `settings.yaml`
  *   section, and a committed change swaps the compiled rule set for the next
  *   spawn without a restart.
+ * - **The read guard is a separate, weaker promise.** Injecting a value creates
+ *   a process that can print it, so two guards exist: `guard.reads` refuses
+ *   injection into the commands whose purpose is reading the environment
+ *   (`env`, `printenv`, …), and `guard.redactOutput` rewrites injected values
+ *   out of tool results. Neither is a sandbox — see the README's security notes
+ *   for what they do not stop.
  *
  * The plugin deliberately does not wrap `spawnTerminal` (interactive PTY
  * sessions are not the credentialed batch commands this exists for), does not
@@ -52,6 +58,9 @@ import type { Logger } from '@deepseek-ai/cordis'
 import type { SettingsProvider } from '@deepseek-ai/dsh-settings'
 import type { SubprocessSpawnSpec } from '@deepseek-ai/dsh-subprocess'
 import z from '@deepseek-ai/schemastery'
+/* Type-only: the tool-registry slice the optional redaction hook consumes. */
+import type { ToolResultBlock, ToolDecision, ToolResultLike } from './tools.js'
+import { asToolEventSource } from './tools.js'
 
 /* ────────────────────────────────────────────────────────────────────────────
  * Plugin identity
@@ -125,6 +134,82 @@ export interface EnvInjectorRule {
   flags: string
 }
 
+/** Whether a prompt-composed shell command line may receive injected values. */
+export type GuardShellPolicy = 'off' | 'model'
+
+/**
+ * The resolved `guard` section: what this plugin refuses to do with a value it
+ * holds, and whether that value is scrubbed from tool results.
+ */
+export interface GuardConfig {
+  /**
+   * Refuse injection into guard-specific read commands. `true` (the default)
+   * keeps THIS plugin from being the thing that hands a credential to `env`,
+   * `printenv` and friends.
+   */
+  reads: boolean
+  /**
+   * Whether a shell command line the model composed (`bash -c '…'`, the shape
+   * `dsh-bash-tool` always produces, sandbox wrapping included) may still
+   * receive values.
+   *
+   * `'off'` (the default) keeps today's behaviour: `bash -c 'git push'` gets
+   * the token, and so does `bash -c 'echo $GH_TOKEN'` — which is only mitigated
+   * by {@link GuardConfig.redactOutput}, never prevented. `'model'` refuses
+   * injection whenever the spawn's argv is a shell carrying a command line, so
+   * a value can never reach a process whose command line the caller composed.
+   */
+  shells: GuardShellPolicy
+  /**
+   * Replace injected values found in tool results with {@link GuardConfig.marker}.
+   * This is harm reduction, not a guarantee: an encoded, split or relayed value
+   * can still reach the model (see the README's security notes).
+   */
+  redactOutput: boolean
+  /** Replacement text; `{name}` is substituted with the variable's name. */
+  marker: string
+  /**
+   * Read commands to refuse, replacing {@link DEFAULT_READ_COMMANDS} when
+   * non-empty. Matched case-insensitively against an invocation's command name
+   * (and its full path), so `env` covers `/usr/bin/env`.
+   */
+  denyCommands: string[]
+}
+
+/**
+ * Commands that exist to read or rewrite the environment, refused by default
+ * as injection targets ({@link GuardConfig.reads}).
+ *
+ * The list is deliberately limited to commands whose *purpose* is the
+ * environment — a heuristic, not a boundary — so that narrowing a rule set
+ * stays the real control. It is matched case-insensitively, which is what makes
+ * the Windows spellings (`SET`, `Get-ChildItem Env:`) covered too.
+ */
+export const DEFAULT_READ_COMMANDS: readonly string[] = [
+  'env', 'printenv', 'set', 'export', 'declare', 'typeset', 'readonly', 'local', 'unset', 'compgen',
+  'gci', 'get-childitem', 'get-item', 'gi',
+]
+
+/** Accepted input for the `guard` section: every field has a default. */
+export interface GuardConfigInput {
+  reads?: boolean
+  shells?: GuardShellPolicy
+  redactOutput?: boolean
+  marker?: string
+  denyCommands?: string[]
+}
+
+/** Schemastery schema of the `guard` section. */
+export const GuardSchema: z<GuardConfigInput, GuardConfig> = z
+  .object({
+    reads: z.boolean().default(true),
+    shells: z.union([z.const('off'), z.const('model')]).default('off'),
+    redactOutput: z.boolean().default(true),
+    marker: z.string().default('[redacted:{name}]'),
+    denyCommands: z.array(z.string()).default([]),
+  })
+  .description('Refuse the read paths that would hand an injected value back to the model.')
+
 /** The resolved `env-injector` section. */
 export interface EnvInjectorConfig {
   /** Ordered rule list; every matching rule contributes its variable. */
@@ -149,6 +234,8 @@ export interface EnvInjectorConfig {
   terminal: boolean
   /** Log every match/miss (info/debug). Off by default to keep spawns quiet. */
   logMatches: boolean
+  /** Refuse the read paths that would hand an injected value back to the model. */
+  guard: GuardConfig
 }
 
 /**
@@ -169,6 +256,7 @@ export interface EnvInjectorConfigInput {
   overrideExisting?: boolean
   terminal?: boolean
   logMatches?: boolean
+  guard?: GuardConfigInput
 }
 
 /** Schemastery schema of one rule. */
@@ -200,6 +288,7 @@ export const Config: z<EnvInjectorConfigInput, EnvInjectorConfig> = z
     overrideExisting: z.boolean().default(true),
     terminal: z.boolean().default(true),
     logMatches: z.boolean().default(false),
+    guard: GuardSchema,
   })
   .description('Rule-driven environment injection for matching child commands.')
 
@@ -216,11 +305,22 @@ export interface CompiledRule {
   readonly envVar: string
 }
 
+/** The compiled form of a {@link GuardConfig}: the read-command set pre-lowercased. */
+export interface CompiledGuard {
+  readonly reads: boolean
+  readonly shells: GuardShellPolicy
+  readonly redactOutput: boolean
+  readonly marker: string
+  /** Lower-cased command names refused as injection targets. */
+  readonly deny: ReadonlySet<string>
+}
+
 /** The compiled form of a whole {@link EnvInjectorConfig}. */
 export interface CompiledConfig {
   readonly rules: readonly CompiledRule[]
   readonly overrideExisting: boolean
   readonly logMatches: boolean
+  readonly guard: CompiledGuard
 }
 
 /**
@@ -253,7 +353,31 @@ export function compileRule(rule: EnvInjectorRule, index: number): CompiledRule 
 }
 
 /**
+ * Compile a resolved guard section: lower-case the refused command names so
+ * matching is case-insensitive on every platform.
+ * @param guard - the resolved `guard` section.
+ * @returns its matching form.
+ */
+export function compileGuard(guard: GuardConfig): CompiledGuard {
+  const configured = guard.denyCommands.filter((entry) => entry.trim().length > 0)
+  const names = configured.length > 0 ? configured : DEFAULT_READ_COMMANDS
+  return {
+    reads: guard.reads,
+    shells: guard.shells,
+    redactOutput: guard.redactOutput,
+    marker: guard.marker,
+    deny: new Set(names.map((entry) => executableName(entry.trim()).toLowerCase())),
+  }
+}
+
+/**
  * Compile a resolved config into its matching form, dropping disabled rules.
+ *
+ * A caller that builds an {@link EnvInjectorConfig} by hand may omit `guard`
+ * (tests do, and so would any embedder); an absent guard compiles to the schema
+ * defaults rather than throwing, so injection keeps working while the guard
+ * falls back to its safe default.
+ *
  * @param config - the resolved `env-injector` section.
  * @returns the compiled rules plus the matching-time options.
  * @throws {Error} when any enabled rule holds an invalid regex.
@@ -264,7 +388,12 @@ export function compileConfig(config: EnvInjectorConfig): CompiledConfig {
     if (!rule.enabled) return
     rules.push(compileRule(rule, index))
   })
-  return { rules, overrideExisting: config.overrideExisting, logMatches: config.logMatches }
+  return {
+    rules,
+    overrideExisting: config.overrideExisting,
+    logMatches: config.logMatches,
+    guard: compileGuard(config.guard ?? Config({}).guard),
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -289,6 +418,25 @@ const SHELL_NAMES = new Set([
 
 /** The flag that introduces a shell's command string. */
 const SHELL_COMMAND_FLAGS = new Set(['-c', '/c', '/k', '-command', '-cmd'])
+
+/**
+ * Whether one argv word is the flag that introduces a shell's command string.
+ *
+ * Long options and Windows switches are matched exactly (`-Command`, `/c`); a
+ * POSIX short-option cluster counts when it carries `c`, because `c` is the
+ * documented spelling of "read the command from the next operand" and shells
+ * are routinely invoked as `bash -lc '…'`, `sh -ec '…'` or `bash -ic '…'`.
+ * Without this, `bash -lc 'gh pr list'` reads as an opaque direct argv: no rule
+ * matches it and no guard can see what it will run.
+ *
+ * @param word - one argv word.
+ * @returns whether it selects the command operand.
+ */
+function isShellCommandFlag(word: string): boolean {
+  const lower = word.toLowerCase()
+  if (SHELL_COMMAND_FLAGS.has(lower)) return true
+  return /^-[A-Za-z]+$/.test(word) && lower.includes('c')
+}
 
 /**
  * Words that wrap another command. They contribute nothing to matching, so
@@ -467,11 +615,20 @@ function splitSegments(line: string): string[] {
  * Reduce one command's words to the invocation the rules match against, by
  * skipping environment assignments and command wrappers (`sudo`, `env`,
  * `nohup`, …) together with their flags and any bare numeric operand.
+ *
+ * The skipped wrappers are COLLECTED rather than dropped: `env`, `sudo` and
+ * friends run the inner command as a child, so they share the environment this
+ * plugin injects and are therefore part of what the guard has to judge. Rules
+ * deliberately do not see them (a `^gh$` rule must match `sudo gh …`), but
+ * {@link GuardConfig.reads} must.
+ *
  * @param words - the words of one shell segment.
- * @returns the invocation, or `undefined` when nothing executable remains.
+ * @returns the invocation (absent when the segment is only wrappers, e.g. a
+ *   trailing `… | env`) and the wrapper commands skipped to reach it.
  */
-function invocationOfWords(words: readonly string[]): Invocation | undefined {
+function invocationOfWords(words: readonly string[]): { invocation?: Invocation; wrappers: Invocation[] } | undefined {
   let index = 0
+  const wrappers: Invocation[] = []
   while (index < words.length) {
     const word = words[index]
     if (word === undefined) break
@@ -481,6 +638,7 @@ function invocationOfWords(words: readonly string[]): Invocation | undefined {
     }
     const base = executableName(word)
     if (COMMAND_WRAPPERS.has(base)) {
+      const start = index
       index += 1
       while (index < words.length) {
         const next = words[index]
@@ -488,27 +646,33 @@ function invocationOfWords(words: readonly string[]): Invocation | undefined {
         if (next.startsWith('-') || NUMERIC_OPERAND.test(next)) index += 1
         else break
       }
+      wrappers.push({ command: base, path: word, args: words.slice(start + 1, index).join(' ') })
       continue
     }
     if (word.length === 0) {
       index += 1
       continue
     }
-    return { command: base, path: word, args: words.slice(index + 1).join(' ') }
+    return { invocation: { command: base, path: word, args: words.slice(index + 1).join(' ') }, wrappers }
   }
-  return undefined
+  return wrappers.length === 0 ? undefined : { wrappers }
 }
 
 /**
  * The command string one shell invocation carries, if it is a shell launched
- * with a command flag (`bash -c …`, `pwsh -Command …`).
+ * with a command flag (`bash -c …`, `pwsh -Command …`, `bash -lc …`).
+ *
+ * The operand is everything after the flag, re-joined as written: splitting the
+ * invocation's `args` on spaces would collapse a quoted program path
+ * (`bash -c '"/opt/my tool" run'`) into words the inner parser then misreads.
+ *
  * @param invocation - the command to inspect.
  * @returns the operand text after the flag, or `undefined` when there is none.
  */
 function nestedCommandLine(invocation: Invocation): string | undefined {
   if (!SHELL_NAMES.has(invocation.command.toLowerCase())) return undefined
   const words = invocation.args.split(' ').filter((word) => word.length > 0)
-  const flagIndex = words.findIndex((word) => SHELL_COMMAND_FLAGS.has(word.toLowerCase()))
+  const flagIndex = words.findIndex((word) => isShellCommandFlag(word))
   if (flagIndex === -1) return undefined
   return words.slice(flagIndex + 1).join(' ')
 }
@@ -518,18 +682,25 @@ function nestedCommandLine(invocation: Invocation): string | undefined {
  * shells (`bash -c 'bash -c "gh pr list"'`).
  * @param line - the command line text.
  * @param depth - how many shell wrappers were already unwrapped.
- * @returns the invocations found, in command-line order.
+ * @returns the invocations found (in command-line order) plus every wrapper
+ *   command skipped on the way.
  */
-function expandCommandLine(line: string, depth: number): Invocation[] {
+function expandCommandLine(line: string, depth: number): { invocations: Invocation[]; wrappers: Invocation[] } {
   const invocations: Invocation[] = []
+  const wrappers: Invocation[] = []
   for (const segment of splitSegments(stripLeadingAssignments(line))) {
-    const invocation = invocationOfWords(splitWords(segment))
-    if (invocation === undefined) continue
-    const nested = depth < MAX_SHELL_DEPTH ? nestedCommandLine(invocation) : undefined
-    if (nested !== undefined && nested.trim().length > 0) invocations.push(...expandCommandLine(nested, depth + 1))
-    else invocations.push(invocation)
+    const parsed = invocationOfWords(splitWords(segment))
+    if (parsed === undefined) continue
+    wrappers.push(...parsed.wrappers)
+    if (parsed.invocation === undefined) continue
+    const nested = depth < MAX_SHELL_DEPTH ? nestedCommandLine(parsed.invocation) : undefined
+    if (nested !== undefined && nested.trim().length > 0) {
+      const inner = expandCommandLine(nested, depth + 1)
+      invocations.push(...inner.invocations)
+      wrappers.push(...inner.wrappers)
+    } else invocations.push(parsed.invocation)
   }
-  return invocations
+  return { invocations, wrappers }
 }
 
 /**
@@ -559,7 +730,7 @@ function expandCommandLine(line: string, depth: number): Invocation[] {
 function findShellCommandLine(argv: readonly string[]): string | undefined {
   for (let flagIndex = argv.length - 2; flagIndex >= 1; flagIndex -= 1) {
     const flag = argv[flagIndex]
-    if (flag === undefined || !SHELL_COMMAND_FLAGS.has(flag.toLowerCase())) continue
+    if (flag === undefined || !isShellCommandFlag(flag)) continue
     for (let index = flagIndex - 1; index >= 0; index -= 1) {
       const word = argv[index]
       if (word === undefined) break
@@ -587,23 +758,69 @@ function findShellCommandLine(argv: readonly string[]): string | undefined {
  *
  * @param argv - the spawn spec's argv.
  * @returns the invocations found, in command-line order; possibly empty.
+ * @see analyseSpawn for the same extraction plus the shell-carried fact.
  */
 export function extractInvocations(argv: readonly string[]): Invocation[] {
+  return analyseSpawn(argv).invocations
+}
+
+/** What one spawn's argv resolves to: the commands, the wrappers, and how they got there. */
+export interface SpawnAnalysis {
+  /** The commands the spawn runs, in command-line order; what the rules match. */
+  readonly invocations: Invocation[]
+  /**
+   * Wrapper commands skipped to reach them (`env`, `sudo`, `nohup`, …). Rules
+   * never see these, but they run the inner command as a child — and therefore
+   * share its environment — so the guard must judge them.
+   */
+  readonly wrappers: Invocation[]
+  /** Whether a shell carried the command line (a caller-composed command line). */
+  readonly viaShell: boolean
+}
+
+/**
+ * Extract a spawn's commands AND report how they are reached.
+ *
+ * {@link extractInvocations} is the matching view; this is the guard's view. The
+ * difference matters because the harness shell tools never spawn the model's
+ * command directly — `dsh-bash-local` builds `['bash','-c',<command line>]` and
+ * the sandbox wraps that behind its own profile arguments — so "did a shell
+ * carry this command line" is exactly "did the caller compose the command line
+ * this process will run", which is what {@link GuardConfig.shells} governs.
+ *
+ * @param argv - the spawn spec's argv.
+ * @returns the invocations, wrappers, and whether a shell carried the command line.
+ */
+export function analyseSpawn(argv: readonly string[]): SpawnAnalysis {
   const first = argv[0]
-  if (first === undefined || first.length === 0) return []
+  if (first === undefined || first.length === 0) return { invocations: [], wrappers: [], viaShell: false }
   const commandLine = findShellCommandLine(argv)
-  if (commandLine !== undefined && commandLine.trim().length > 0) {
-    const invocations = expandCommandLine(commandLine, 0)
-    if (invocations.length > 0) return invocations
+  /* A shell carrying a non-blank command line is the caller composing commands,
+   * whatever those commands turn out to be: `bash -c env` is still a composed
+   * command line even though the only word left after unwrapping is a wrapper. */
+  const composed = commandLine !== undefined && commandLine.trim().length > 0
+  if (composed) {
+    const expanded = expandCommandLine(commandLine, 0)
+    if (expanded.invocations.length > 0) return { ...expanded, viaShell: true }
   }
   const separator = argv.lastIndexOf('--')
   if (separator > 0 && separator < argv.length - 1) {
     const inner = invocationOfWords(argv.slice(separator + 1))
-    if (inner !== undefined) return [inner]
+    if (inner?.invocation !== undefined) {
+      return { invocations: [inner.invocation], wrappers: inner.wrappers, viaShell: false }
+    }
   }
   const direct = invocationOfWords(argv)
-  if (direct !== undefined) return [direct]
-  return [{ command: executableName(first), path: first, args: argv.slice(1).join(' ') }]
+  if (direct?.invocation !== undefined) {
+    return { invocations: [direct.invocation], wrappers: direct.wrappers, viaShell: composed }
+  }
+  if (direct !== undefined && direct.wrappers.length > 0) {
+    /* A direct argv that is only wrappers (`env`, `nohup`) runs nothing itself,
+     * but it is still the thing the caller asked for. */
+    return { invocations: direct.wrappers, wrappers: [], viaShell: composed }
+  }
+  const fallback = { command: executableName(first), path: first, args: argv.slice(1).join(' ') }
+  return { invocations: [fallback], wrappers: [], viaShell: composed || SHELL_NAMES.has(fallback.command.toLowerCase()) }
 }
 
 /**
@@ -655,7 +872,19 @@ export interface InjectionResult<T extends EnvBearingSpec = EnvBearingSpec> {
   /** Names actually injected, in rule order. */
   readonly injected: readonly string[]
   /** Rules that matched but had no usable source value. */
-  readonly skipped: readonly { readonly envVar: string; readonly reason: 'unset' | 'caller' }[]
+  readonly skipped: readonly { readonly envVar: string; readonly reason: 'unset' | 'caller' | 'guard' }[]
+  /**
+   * Rules whose value was withheld because the spawn is a read channel
+   * ({@link GuardConfig.reads}) or a caller-composed shell command line
+   * ({@link GuardConfig.shells}). Diagnostics only — the spec stays untouched.
+   */
+  readonly blocked: readonly {
+    readonly envVar: string
+    readonly rule: number
+    readonly command: string
+    /** Why the guard refused, e.g. `env reads or rewrites the environment`. */
+    readonly reason: string
+  }[]
 }
 
 /**
@@ -678,13 +907,40 @@ export interface EnvBearingSpec {
 export type InjectionWarning = (envVar: string, message: string) => void
 
 /**
+ * Which {@link CompiledGuard} rule refuses this spawn, if any.
+ *
+ * A refusal withholds EVERY matched value from the whole spawn, not just the
+ * rule that hit the guard: `env GH_TOKEN=x gh pr list` runs `env` as part of the
+ * same process tree, so handing the token to `gh` while "skipping" `env` would
+ * protect nothing.
+ *
+ * @param invocations - the commands found in the spawn's argv.
+ * @param viaShell - whether a shell carried the command line.
+ * @param guard - the compiled guard.
+ * @returns a human-readable reason, or `undefined` when injection may proceed.
+ */
+function guardRefusal(
+  invocations: readonly Invocation[],
+  viaShell: boolean,
+  guard: CompiledGuard,
+): string | undefined {
+  if (guard.reads) {
+    const denied = invocations.find((invocation) =>
+      guard.deny.has(invocation.command.toLowerCase()) || guard.deny.has(invocation.path.toLowerCase()))
+    if (denied !== undefined) return `${denied.command} reads or rewrites the environment`
+  }
+  if (guard.shells === 'model' && viaShell) return 'a shell carries a caller-composed command line'
+  return undefined
+}
+
+/**
  * Apply the compiled rules to one spawn or terminal spec.
  *
  * The input spec is never mutated: on a successful match the result is a new
  * object whose `env` is `{ ...spec.env, [envVar]: value }`. When nothing
- * matches, or the source variable is unset/empty, the ORIGINAL spec object is
- * returned, so an unaffected request behaves exactly as it would without this
- * plugin installed.
+ * matches, the source variable is unset/empty, or the guard refuses the spawn,
+ * the ORIGINAL spec object is returned, so an unaffected request behaves exactly
+ * as it would without this plugin installed.
  *
  * @param spec - the caller's spec.
  * @param compiled - the current compiled rules and matching options.
@@ -696,11 +952,32 @@ export function injectEnvForSpec<T extends EnvBearingSpec>(
   compiled: CompiledConfig,
   warn?: InjectionWarning,
 ): InjectionResult<T> {
-  const inert: InjectionResult<T> = { spec, injected: [], skipped: [] }
+  const inert: InjectionResult<T> = { spec, injected: [], skipped: [], blocked: [] }
   if (spec === null || typeof spec !== 'object' || !Array.isArray(spec.argv) || compiled.rules.length === 0) return inert
-  const invocations = extractInvocations(spec.argv)
+  const { invocations, wrappers, viaShell } = analyseSpawn(spec.argv)
   if (invocations.length === 0) return inert
+  /*
+   * The guard is evaluated BEFORE and INDEPENDENTLY of the rules: whether a
+   * spawn is a read channel is a property of the command, not of what a
+   * deployment happened to configure. `env GH_TOKEN=x gh pr list` must be
+   * refused even when no rule mentions `env` — and `env` is exactly the word
+   * the rule matcher unwraps away, which is why wrappers are checked too.
+   */
+  const refusal = guardRefusal([...invocations, ...wrappers], viaShell, compiled.guard)
   const matches = matchRules(invocations, compiled.rules)
+  if (refusal !== undefined && matches.length > 0) {
+    return {
+      spec,
+      injected: [],
+      skipped: matches.map((rule) => ({ envVar: rule.envVar, reason: 'guard' as const })),
+      blocked: matches.map((rule) => ({
+        envVar: rule.envVar,
+        rule: rule.index,
+        command: invocations.map((invocation) => invocation.command).join(', '),
+        reason: refusal,
+      })),
+    }
+  }
   if (matches.length === 0) return inert
   const env: Record<string, string | undefined> = { ...spec.env }
   const injected: string[] = []
@@ -719,8 +996,171 @@ export function injectEnvForSpec<T extends EnvBearingSpec>(
     env[rule.envVar] = value
     injected.push(rule.envVar)
   }
-  if (injected.length === 0) return { spec, injected, skipped }
-  return { spec: { ...spec, env }, injected, skipped }
+  if (injected.length === 0) return { spec, injected, skipped, blocked: [] }
+  return { spec: { ...spec, env }, injected, skipped, blocked: [] }
+}
+
+/* ────────────────────────────────────────────────────────────────────────────
+ * Output redaction
+ * ──────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Values shorter than this are never redacted: a two-character "secret" would
+ * match half the alphabet and turn every result into noise. Every credential
+ * worth injecting is longer than this.
+ */
+const MIN_REDACTABLE_BYTES = 8
+
+/** How a redaction pair's text relates to the variable's value. */
+export type RedactionForm = 'raw' | 'base64' | 'hex'
+
+/** One literal to replace, and the variable name the replacement names. */
+export interface RedactionPair {
+  /** The literal text that may appear in a result. */
+  readonly text: string
+  /** How {@link RedactionPair.text} encodes the variable's value. */
+  readonly form: RedactionForm
+  /** The variable the literal came from, used for the marker. */
+  readonly envVar: string
+  /** The value's byte length, so ordering is by the underlying secret. */
+  readonly bytes: number
+}
+
+/**
+ * Build the literals to redact for the given variables: the value as-is, plus
+ * the base64 and hex encodings that one shell pipeline would produce
+ * (`base64 <<< "$TOKEN"`, `xxd -p`).
+ *
+ * The value is read from `process.env` HERE and never retained: pairs are
+ * rebuilt per redaction, so a rotated variable is redacted at its current
+ * value and this plugin holds no copy of a credential between calls.
+ *
+ * @param envVars - the variable names that were injected, in injection order.
+ * @param env - the environment to read from (defaults to `process.env`).
+ * @returns the pairs, longest secret first so a shared prefix cannot shadow a
+ *   longer match; empty when every value is unset, empty, or too short.
+ */
+export function redactionPairs(
+  envVars: Iterable<string>,
+  env: Record<string, string | undefined> = process.env,
+): RedactionPair[] {
+  const pairs: RedactionPair[] = []
+  const seen = new Set<string>()
+  for (const envVar of [...envVars].sort()) {
+    const value = env[envVar]
+    if (value === undefined || value.length === 0) continue
+    const bytes = Buffer.byteLength(value, 'utf8')
+    if (bytes < MIN_REDACTABLE_BYTES) continue
+    const forms: [RedactionForm, string][] = [
+      ['raw', value],
+      ['base64', Buffer.from(value, 'utf8').toString('base64')],
+      ['hex', Buffer.from(value, 'utf8').toString('hex')],
+    ]
+    for (const [form, text] of forms) {
+      if (text.length === 0 || seen.has(text)) continue
+      seen.add(text)
+      pairs.push({ text, form, envVar, bytes })
+    }
+  }
+  /* Encoded forms first: a byte sequence never survives base64/hex, but a
+   * short secret can be a substring of its own longer encoding. */
+  return pairs.sort((left, right) => (right.form === left.form ? right.bytes - left.bytes : left.form === 'raw' ? 1 : -1))
+}
+
+/** Whether a literal is a pure even-length hex string. */
+function isHexText(text: string): boolean {
+  return text.length % 2 === 0 && /^[0-9a-fA-F]+$/.test(text)
+}
+
+/**
+ * Replace every injected value in one text block.
+ *
+ * The marker's own literal is replaced first (with itself, as it must already
+ * be redacted) so a secret containing the marker text cannot turn the marker
+ * into a different string. A hit is only accepted when the literal actually
+ * decodes back to a known value, which keeps a coincidental hex-looking word
+ * from being masked.
+ *
+ * @param text - the model-facing text.
+ * @param pairs - the literals to replace, from {@link redactionPairs}.
+ * @param marker - the replacement, with `{name}` substituted.
+ * @returns the redacted text, or the ORIGINAL string when nothing matched.
+ */
+export function redactValues(text: string, pairs: readonly RedactionPair[], marker: string): string {
+  if (text.length === 0) return text
+  let redacted = text
+  for (const { text: literal, form, envVar } of pairs) {
+    if (!redacted.includes(literal)) continue
+    if (form !== 'raw') {
+      const decoded = Buffer.from(literal, form).toString('utf8')
+      if (!pairs.some((pair) => pair.form === 'raw' && pair.envVar === envVar && pair.text === decoded)) continue
+    }
+    redacted = redacted.split(literal).join(marker.replaceAll('{name}', envVar))
+  }
+  return redacted === text ? text : redacted
+}
+
+/**
+ * Apply {@link redactValues} to every text block of a result projection.
+ *
+ * Only `text` blocks are rewritten: a JSON result's `value`, a `thinking` block
+ * and any non-text block are returned by reference, so redaction cannot change
+ * what a downstream tool parses or how a stored transcript replays.
+ *
+ * @param blocks - the content blocks of a tool result.
+ * @param pairs - the literals to replace.
+ * @param marker - the replacement, with `{name}` substituted.
+ * @returns replacement blocks, or `undefined` when nothing matched.
+ */
+export function redactBlocks<T extends ToolResultBlock>(
+  blocks: readonly T[],
+  pairs: readonly RedactionPair[],
+  marker: string,
+): T[] | undefined {
+  let changed = false
+  const next = blocks.map((block) => {
+    if (block.type !== 'text' || typeof block.text !== 'string') return block
+    const text = redactValues(block.text, pairs, marker)
+    if (text === block.text) return block
+    changed = true
+    return { ...block, text }
+  })
+  return changed ? next : undefined
+}
+
+/**
+ * Build the `tools/post-execute` listener that redacts injected values.
+ *
+ * Extracted from the plugin body so the redaction contract is testable without
+ * a tool registry: the listener delegates with `next()` first (so a tool-owned
+ * projection runs before redaction), returns the decision untouched unless it
+ * accepted a content projection, and never touches `value` or `block`
+ * decisions.
+ *
+ * @param read - thunk returning the current compiled config, read per call so a
+ *   live settings change takes effect immediately.
+ * @param injected - thunk returning the names this installation has injected.
+ * @returns the listener to register on `tools/post-execute`.
+ */
+export function makeRedactionListener(
+  read: () => CompiledConfig,
+  injected: () => Iterable<string>,
+): (exec: unknown, result: ToolResultLike, next: () => Promise<ToolDecision>) => Promise<ToolDecision> {
+  return async (_exec, result, next) => {
+    const decision = await next()
+    if (decision.kind !== 'accept' || Object.hasOwn(decision, 'value')) return decision
+    const guard = read().guard
+    if (!guard.redactOutput) return decision
+    const pairs = redactionPairs(injected())
+    if (pairs.length === 0) return decision
+    const content = redactBlocks((decision.content ?? result.content ?? []) as readonly ToolResultBlock[], pairs, guard.marker)
+    if (content === undefined) return decision
+    return {
+      kind: 'accept',
+      content,
+      ...decision.additionalContexts === undefined ? {} : { additionalContexts: decision.additionalContexts },
+    }
+  }
 }
 
 /* ────────────────────────────────────────────────────────────────────────────
@@ -791,6 +1231,8 @@ export function subprocessRuntime(view: unknown): Record<PropertyKey, unknown> {
  * @param methods - the method names to wrap (`spawn`, and `spawnTerminal` when terminal sessions are covered).
  * @param read - thunk returning the current compiled rules.
  * @param log - this plugin's logger.
+ * @param onInjected - called with the names a spawn actually received, so the
+ *   caller can track which variables exist to redact from tool results.
  * @returns the disposer restoring the original methods.
  * @throws {TypeError} when a method cannot be patched.
  * @throws {Error} when this runtime already carries the patch.
@@ -800,6 +1242,7 @@ export function installSpawnInjection(
   methods: readonly WrappedMethod[],
   read: () => CompiledConfig,
   log: Logger,
+  onInjected?: (envVars: readonly string[]) => void,
 ): () => void {
   if (runtime[PATCH_MARKER] !== undefined || PATCHED_RUNTIMES.has(runtime)) {
     throw new Error(`${NS}: ctx.subprocess is already wrapped by this plugin (duplicate profile layer?)`)
@@ -821,6 +1264,8 @@ export function installSpawnInjection(
   let active = true
   /** Variables already reported as matched-but-unset, per installation. */
   const warned = new Set<string>()
+  /** Refusals already reported, so a retry loop cannot flood the log. */
+  const blocked = new Set<string>()
   const notify: InjectionWarning = (envVar, message) => {
     if (warned.has(envVar)) return
     warned.add(envVar)
@@ -837,10 +1282,20 @@ export function installSpawnInjection(
         if (spec === null || typeof spec !== 'object') return Reflect.apply(original, this, args)
         const compiled = read()
         const result = injectEnvForSpec(spec as EnvBearingSpec, compiled, notify)
+        if (result.injected.length > 0) onInjected?.(result.injected)
         if (compiled.logMatches) {
           const command = (spec as EnvBearingSpec).argv?.join(' ') ?? ''
           if (result.injected.length > 0) note(log, 'info', `${method}: injected ${result.injected.join(', ')} for: ${command}`)
           else note(log, 'info', `${method}: no injection for: ${command}`)
+        }
+        /* A refusal is a security decision, so it is reported regardless of
+         * `logMatches` — but it is reported once per (variable, command) pair,
+         * because a tool runner retries and a chatty log helps nobody. */
+        for (const block of result.blocked) {
+          const seen = `${block.envVar}\u0000${block.command}`
+          if (blocked.has(seen)) continue
+          blocked.add(seen)
+          note(log, 'info', `guard: refused ${block.envVar} (rule ${String(block.rule)}) for: ${block.command}`)
         }
         if (result.spec === spec) return Reflect.apply(original, this, args)
         return Reflect.apply(original, this, [result.spec, ...args.slice(1)])
@@ -894,6 +1349,16 @@ function describeRules(rules: readonly CompiledRule[]): string {
   if (rules.length === 0) return 'no rules enabled'
   const shown = rules.slice(0, 5).map((rule) => `${rule.command.source}${rule.argsPattern === undefined ? '' : ` ${rule.argsPattern.source}`} → ${rule.envVar}`)
   return `${String(rules.length)} rule(s): ${shown.join('; ')}${rules.length > shown.length ? '; …' : ''}`
+}
+
+/**
+ * One-line summary of the read guard, so a deployment log answers "is the
+ * guard on, and how strict is it?" without reading the config back.
+ * @param guard - the compiled guard.
+ * @returns its human-readable state.
+ */
+export function describeGuard(guard: CompiledGuard): string {
+  return `reads=${guard.reads ? 'deny' : 'off'} shells=${guard.shells} redact=${guard.redactOutput ? 'on' : 'off'}`
 }
 
 /**
@@ -973,16 +1438,51 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
 
   const runtime = subprocessRuntime(ctx.get('subprocess'))
   const methods: WrappedMethod[] = entry.terminal ? [...WRAPPED_METHODS] : ['spawn']
-  const uninstall = installSpawnInjection(runtime, methods, () => compiled, log)
+  /**
+   * Names this installation has actually injected. Only NAMES are kept — never
+   * values: the redaction below re-reads `process.env` each time, so a rotated
+   * variable needs no bookkeeping and this plugin holds no credential copy.
+   */
+  const injectedNames = new Set<string>()
+  const uninstall = installSpawnInjection(runtime, methods, () => compiled, log, (names) => {
+    for (const envVar of names) injectedNames.add(envVar)
+  })
   ctx.effect(() => uninstall, 'env-injector: restore ctx.subprocess methods')
+
+  /**
+   * Redact injected values from tool results.
+   *
+   * This is the SECOND layer of the read guard, and the weaker one: it depends
+   * on a value reaching a tool result verbatim (or one base64/hex step away).
+   * A value that is split, re-encoded differently or relayed by the command
+   * itself still reaches the model — the README says so plainly.
+   *
+   * The tools service is optional, exactly like settings: injection works
+   * without it, and the wiring is feature-detected at runtime.
+   */
+  let redactionAttached = false
+  ctx.inject(['tools'], (toolsCtx) => {
+    /* `ctx.get` rather than `toolsCtx.tools`: this package declares no service
+     * augmentation for the optional registry (see `src/tools.ts`), so the
+     * lookup is the seam. */
+    const tools = asToolEventSource(toolsCtx.get('tools'))
+    if (tools === undefined) return
+    tools.on('tools/post-execute', makeRedactionListener(() => compiled, () => injectedNames))
+    redactionAttached = true
+  })
+
   /*
    * The settings service attaches asynchronously, so the authoritative source
    * is only known one tick later — and that is exactly what an operator needs
    * from the harness log: that the wrapper is installed, which rules it will
-   * use, and which layer supplied them.
+   * use, which layer supplied them, and whether the read guard is doing
+   * anything.
    */
   setTimeout(() => {
     note(log, 'info', `wrapping ctx.subprocess.${methods.join('/')} — ${describeRules(compiled.rules)} (source: ${settingsAttached ? 'settings.yaml over the composition entry' : 'composition entry only'})`)
+    note(log, 'info', `guard: ${describeGuard(compiled.guard)}${redactionAttached ? '' : ' — output redaction unavailable (no tools service mounted)'}`)
+    if (!compiled.guard.redactOutput || redactionAttached) return
+    note(log, 'warn', 'guard.redactOutput is on but no tools service is mounted; injected values can still be echoed into a result')
   }, 0).unref()
 }
 

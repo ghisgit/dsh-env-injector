@@ -35,6 +35,8 @@ not. Nothing else changes.
 | **Unset variable ⇒ no change** | A rule whose `envVar` is missing (or empty) in `process.env` injects nothing and warns once, naming the variable. |
 | **Only the subprocess seam is touched** | One own data property per wrapped method on the service instance, restored on unload: `spawn` always, `spawnTerminal` while `terminal: true`. `resolveExecutable` and the rest of the seam are untouched. |
 | **Rules are live** | Editing `$DSH_HOME/settings.yaml` re-compiles the rules for the next spawn — no restart, no reload. |
+| **Read commands never receive a value** *(guard)* | A spawn containing `env`, `printenv` or another configured reader is refused wholesale — the caller's original spec object is returned, so nothing was added. Enforced in the injection path; no service required. |
+| **Injected values are scrubbed from results** *(guard)* | A `tools/post-execute` listener replaces the value (and its base64/hex forms) with `[redacted:NAME]` in text blocks. Harm reduction, not a guarantee — see the security notes. |
 
 ## Install
 
@@ -100,6 +102,7 @@ dsh web 2>&1 | grep '\[env-injector\]'              # foreground: they go to std
 # or: whatever captures the harness process's stdout/stderr
 # [env-injector] settings namespace 'env-injector' attached — 1 rule(s): ^gh(\.exe)?$ → GH_TOKEN
 # [env-injector] wrapping ctx.subprocess.spawn/spawnTerminal — 1 rule(s): ^gh(\.exe)?$ → GH_TOKEN (source: settings.yaml over the composition entry)
+# [env-injector] guard: reads=deny shells=off redact=on
 ```
 
 The `wrapping …` line is the authoritative one: it is emitted one tick later,
@@ -162,6 +165,12 @@ env-injector:
   overrideExisting: true             # default true: the harness value wins over spec.env
   terminal: true                     # default true: also cover spawnTerminal (PTY sessions)
   logMatches: false                  # default false: log each match (info) / miss (debug)
+  guard:
+    reads: true                      # default true: refuse injection into env/printenv-style commands
+    shells: off                      # default off: a `bash -c '…'` command line still receives values
+    redactOutput: true               # default true: scrub injected values out of tool results
+    marker: '[redacted:{name}]'      # default: replacement text, {name} = the variable
+    denyCommands: []                 # default []: use the built-in reader list; non-empty REPLACES it
 ```
 
 `command` and `argsPattern` are **regex source strings**, never `/…/` literals —
@@ -178,6 +187,61 @@ is tested as `gh`) and against the full word as a fallback, so both `^gh$` and
 spaces, with each command in a shell line matched separately. Lists replace
 wholesale (arrays do not merge), so a `rules:` list in `settings.yaml` is the
 complete list.
+
+### The read guard: keeping a value out of the model's reach
+
+Injecting a value creates a process that can print it: any child the harness
+spawns can run `echo $GH_TOKEN`. Two layers make that harder, and neither is a
+sandbox — read the strengths before relying on them.
+
+**Layer A — refuse the read commands (`guard.reads`, default on).** A spawn
+whose command line contains a command that exists to read or rewrite the
+environment is not injected at all, wherever that command sits: as the command,
+as a pipeline stage, or as a wrapper.
+
+```yaml
+env-injector:
+  guard:
+    reads: true
+    denyCommands: []        # [] = the built-in list; non-empty REPLACES it
+```
+
+Built-in list: `env`, `printenv`, `set`, `export`, `declare`, `typeset`,
+`readonly`, `local`, `unset`, `compgen`, and the PowerShell spellings `gci`,
+`Get-ChildItem`, `Get-Item`, `gi` (matching is case-insensitive, so Windows'
+`SET` is covered too). The refusal withholds **every** matched value from that
+spawn, not just the rule that hit a reader — `gh pr list | env` runs both in one
+process tree, so a partial refusal would protect nothing. A refusal is logged as
+`guard: refused GH_TOKEN (rule 0) for: gh, env`, once per variable and command
+line.
+
+**Layer B — scrub the results (`guard.redactOutput`, default on).** Every value
+this plugin injected is replaced in tool results by `guard.marker`
+(`[redacted:GH_TOKEN]`), in its raw form and in one base64/hex step
+(`base64 <<< "$TOKEN"`). Values shorter than 8 bytes are left alone, so a short
+variable cannot turn every result into noise. Only text blocks are rewritten —
+a JSON result's `value` and non-text blocks are untouched, so nothing downstream
+parses differently. Layer B needs the tool registry; without one the plugin says
+so at load (`output redaction unavailable (no tools service mounted)`) and layer
+A keeps working.
+
+**Layer C — you decide (`guard.shells`).** The harness bash tool always runs the
+model's command as `bash -c '<command line>'`. With the default `shells: off`
+that command line still receives values, so `bash -c 'git push'` works and
+`bash -c 'echo $GH_TOKEN'` also receives the variable — layer B is the only
+thing standing between that value and the model. Set `shells: model` to refuse
+every caller-composed command line:
+
+```yaml
+env-injector:
+  guard:
+    shells: model           # no shell command line is ever injected
+```
+
+With `shells: model`, credential-requiring commands must be spawned by a plugin
+(direct `argv`, not through a shell), because the model's own `bash -c 'git
+push'` will no longer receive the token. That is the honest trade: `off` is
+convenient, `model` is what "the model cannot read it" actually requires.
 
 ### Persistent shells and PTY sessions (`minimal` preset)
 
@@ -329,6 +393,7 @@ logger. Only variable *names* are ever logged — never values.
 | `>= 0.1.5-rc.1` (current) | Uses `ctx.settings.installSection()`: entry as base layer, automatic source attach/detach, `validate` at write time. |
 | Older `@deepseek-ai/dsh-settings` | Falls back automatically to `register()` + `watch()` + a disposal effect (see `src/index.ts`). |
 | No settings provider | Runs from the composition entry; every rule edit needs a restart (or a live patch edit). The shipped entry has no rules, so you must add them there. |
+| No tool registry | The read guard's denial layer is unaffected (it lives in the injection path). Output redaction is unavailable, and the load notice says so. |
 | No `ctx.subprocess` (pre-seam DSH) | The plugin simply never activates — `inject: ['subprocess']` is never satisfied, so nothing is patched and nothing fails. |
 
 The fallback path is feature-detected at runtime, not version-sniffed:
@@ -380,6 +445,24 @@ so `git push` over HTTPS works without an interactive prompt.
 * Injection always wins over the harness scrub *by design*: it is the same
   explicit-`env` layer a trusted caller would use. The scrub keeps protecting
   every other variable and every non-matching command.
+* **What the read guard does not stop** (the defaults, `reads: true` +
+  `shells: off`):
+  * `bash -c 'echo $GH_TOKEN'` still receives the variable — the model's shell
+    command line is injected like any other, and only output redaction stands
+    between that value and the model. Set `guard.shells: model` to refuse it.
+  * Redaction matches the value, so a transformation it does not know
+    (another encoding, a split, a substring, a character-wise rewrite) passes
+    through. It also only sees results the model is shown in text blocks.
+  * A command that receives the value can leak it **without printing it**:
+    writing it to a file, feeding it to a hook or another program, sending it
+    over the network. `git push` runs `.git/hooks/*`, which a model with
+    workspace write access can author. No environment-layer guard can see that.
+  * This is therefore *harm reduction with a clear audit trail*, not isolation.
+    Real isolation is a separate OS user, a container, or a credential proxy —
+    out of scope for an environment-injection plugin.
+* The practical minimum: narrow rules (`^git(\.exe)?$` with an `argsPattern`,
+  not `.*`), `guard.reads: true`, and a harness whose workspace the model cannot
+  use to author what an injected command will execute.
 
 ## Limitations
 
@@ -394,24 +477,34 @@ so `git push` over HTTPS works without an interactive prompt.
 * Bare numeric operands after a wrapper are skipped (`nice -n 5 gh`), but a rule
   is not evaluated against a wrapper's own arguments.
 * Rule arrays replace wholesale; there is no per-rule merge or stable rule id.
+* The guard's reader list is a heuristic over command names, not a boundary:
+  anything that can read the environment (`cat /proc/self/environ`, a language
+  runtime's `os.environ`, a script the model writes) is out of its reach. It
+  exists to stop the plugin from *handing* a value to an obvious reader.
+* Redaction ignores values shorter than 8 bytes, and a value that is a common
+  word would be redacted wherever it appears — the guard does not try to be
+  clever about either case.
 
 ## Development
 
 ```bash
 pnpm install                    # add --registry=https://registry.npmjs.org/ if your mirror lacks the rc builds
 pnpm build                      # tsc → lib/ (committed: the loader imports lib/index.js)
-pnpm test                       # 57 tests: matching, injection, live settings, older-provider fallback, packaging
+pnpm test                       # 84 tests: matching, injection, guard, redaction, live settings, fallback, packaging
+pnpm resolve-rules              # which rules AND which guard are really in force right now
 ```
 
 | File | Role |
 |---|---|
-| `src/index.ts` | The whole plugin: schema, rule compilation, argv analysis, spawn wrapper, settings wiring. |
+| `src/index.ts` | The whole plugin: schema, rule compilation, argv analysis, spawn wrapper, guard enforcement, redaction listener, settings wiring. |
+| `src/tools.ts` | The optional tool-registry seam, declared structurally: this package imports no `@deepseek-ai/dsh-tools` types, so redaction costs consumers no extra peer packages. |
 | `lib/index.js` | Built output — what `dsh` actually imports (one runtime import: `@deepseek-ai/schemastery`). |
 | `cordis.patch.yml` | The bundle layer: one `insert` row whose composition entry carries an empty `rules:` list (the commented example rules are the documented starting point, not defaults). |
-| `scripts/resolve-rules.mjs` | Offline probe: applies defaults → composition entry → `settings.yaml` by hand and prints which rules are really in force, since `--dump-config` cannot show the settings layer. |
+| `scripts/resolve-rules.mjs` | Offline probe: applies defaults → composition entry → `settings.yaml` by hand and prints which rules AND which guard are really in force, since `--dump-config` cannot show the settings layer. |
 | `test/match.test.mjs` | Pure matching/injection unit tests, including the pass-through identity guarantee. |
+| `test/guard.test.mjs` | The read guard: reader refusal (as command, pipeline stage and wrapper), the `shells` policy, and the redaction contract (raw/base64/hex, short values, non-text blocks). |
 | `test/sandbox.test.mjs` | The real sandbox provider + real subprocess provider: asserts the confined argv shape and that injection survives it. |
-| `test/e2e.test.mjs` | Real `dsh-subprocess-local` + real `dsh-settings-file`: a real `bash` child prints its own environment, a real `settings.yaml` edit re-rules it live, and the older-provider fallback runs with `installSection` removed from the real service. |
+| `test/e2e.test.mjs` | Real `dsh-subprocess-local` + real `dsh-settings-file`: a real `bash` child prints its own environment, a real `settings.yaml` edit re-rules it live, the guard blocks a real `env` spawn, and the redaction listener scrubs a real injected value. |
 | `test/packaging.test.mjs` | The install claims: bundle patch, published paths, profile-shaped resolution and `unwrapExports`. |
 
 ## Credits
