@@ -147,11 +147,22 @@ export interface GuardConfig {
     /** Replacement text; `{name}` is substituted with the variable's name. */
     marker: string;
     /**
-     * Read commands to refuse, replacing {@link DEFAULT_READ_COMMANDS} when
-     * non-empty. Matched case-insensitively against an invocation's command name
-     * (and its full path), so `env` covers `/usr/bin/env`.
+     * Read commands to refuse **in addition to** {@link DEFAULT_READ_COMMANDS}.
+     *
+     * Adding a name can only make the guard stricter: the built-in list stays in
+     * force no matter what this is set to, and a name that is already covered is
+     * a no-op. This field once REPLACED the built-in list, which meant
+     * `denyCommands: ['tee']` silently stopped refusing `env` — a security switch
+     * must not weaken protection as a side effect of being configured.
      */
     denyCommands: string[];
+    /**
+     * Opt out of {@link DEFAULT_READ_COMMANDS} entirely, keeping only
+     * {@link GuardConfig.denyCommands}. A deliberate escape hatch for a
+     * deployment that needs one of those names injected; the load notice warns
+     * whenever the built-in list is not in force.
+     */
+    denyCommandsOnly: boolean;
 }
 /**
  * Commands that exist to read or rewrite the environment, refused by default
@@ -170,6 +181,7 @@ export interface GuardConfigInput {
     redactOutput?: boolean;
     marker?: string;
     denyCommands?: string[];
+    denyCommandsOnly?: boolean;
 }
 /** Schemastery schema of the `guard` section. */
 export declare const GuardSchema: z<GuardConfigInput, GuardConfig>;
@@ -250,6 +262,12 @@ export interface CompiledGuard {
     readonly marker: string;
     /** Lower-cased command names refused as injection targets. */
     readonly deny: ReadonlySet<string>;
+    /**
+     * Built-in reader names the configuration has taken OUT of force. Empty
+     * unless {@link GuardConfig.denyCommandsOnly} is set; the load notice reports
+     * it so a deliberate opt-out is never silent.
+     */
+    readonly dropped: readonly string[];
 }
 /** The compiled form of a whole {@link EnvInjectorConfig}. */
 export interface CompiledConfig {
@@ -269,6 +287,11 @@ export declare function compileRule(rule: EnvInjectorRule, index: number): Compi
 /**
  * Compile a resolved guard section: lower-case the refused command names so
  * matching is case-insensitive on every platform.
+ *
+ * The built-in reader list stays in force unless `denyCommandsOnly` opts out,
+ * so a `denyCommands` entry can only ever ADD a refusal. This is deliberate:
+ * configuring a security switch must not be able to weaken it by accident.
+ *
  * @param guard - the resolved `guard` section.
  * @returns its matching form.
  */

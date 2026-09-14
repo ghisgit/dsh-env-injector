@@ -169,11 +169,22 @@ export interface GuardConfig {
   /** Replacement text; `{name}` is substituted with the variable's name. */
   marker: string
   /**
-   * Read commands to refuse, replacing {@link DEFAULT_READ_COMMANDS} when
-   * non-empty. Matched case-insensitively against an invocation's command name
-   * (and its full path), so `env` covers `/usr/bin/env`.
+   * Read commands to refuse **in addition to** {@link DEFAULT_READ_COMMANDS}.
+   *
+   * Adding a name can only make the guard stricter: the built-in list stays in
+   * force no matter what this is set to, and a name that is already covered is
+   * a no-op. This field once REPLACED the built-in list, which meant
+   * `denyCommands: ['tee']` silently stopped refusing `env` — a security switch
+   * must not weaken protection as a side effect of being configured.
    */
   denyCommands: string[]
+  /**
+   * Opt out of {@link DEFAULT_READ_COMMANDS} entirely, keeping only
+   * {@link GuardConfig.denyCommands}. A deliberate escape hatch for a
+   * deployment that needs one of those names injected; the load notice warns
+   * whenever the built-in list is not in force.
+   */
+  denyCommandsOnly: boolean
 }
 
 /**
@@ -197,6 +208,7 @@ export interface GuardConfigInput {
   redactOutput?: boolean
   marker?: string
   denyCommands?: string[]
+  denyCommandsOnly?: boolean
 }
 
 /** Schemastery schema of the `guard` section. */
@@ -207,6 +219,7 @@ export const GuardSchema: z<GuardConfigInput, GuardConfig> = z
     redactOutput: z.boolean().default(true),
     marker: z.string().default('[redacted:{name}]'),
     denyCommands: z.array(z.string()).default([]),
+    denyCommandsOnly: z.boolean().default(false),
   })
   .description('Refuse the read paths that would hand an injected value back to the model.')
 
@@ -313,6 +326,12 @@ export interface CompiledGuard {
   readonly marker: string
   /** Lower-cased command names refused as injection targets. */
   readonly deny: ReadonlySet<string>
+  /**
+   * Built-in reader names the configuration has taken OUT of force. Empty
+   * unless {@link GuardConfig.denyCommandsOnly} is set; the load notice reports
+   * it so a deliberate opt-out is never silent.
+   */
+  readonly dropped: readonly string[]
 }
 
 /** The compiled form of a whole {@link EnvInjectorConfig}. */
@@ -355,18 +374,30 @@ export function compileRule(rule: EnvInjectorRule, index: number): CompiledRule 
 /**
  * Compile a resolved guard section: lower-case the refused command names so
  * matching is case-insensitive on every platform.
+ *
+ * The built-in reader list stays in force unless `denyCommandsOnly` opts out,
+ * so a `denyCommands` entry can only ever ADD a refusal. This is deliberate:
+ * configuring a security switch must not be able to weaken it by accident.
+ *
  * @param guard - the resolved `guard` section.
  * @returns its matching form.
  */
 export function compileGuard(guard: GuardConfig): CompiledGuard {
-  const configured = guard.denyCommands.filter((entry) => entry.trim().length > 0)
-  const names = configured.length > 0 ? configured : DEFAULT_READ_COMMANDS
+  const extra = guard.denyCommands
+    .map((entry) => executableName(entry.trim()).toLowerCase())
+    .filter((entry) => entry.length > 0)
+  const names = guard.denyCommandsOnly ? extra : [...DEFAULT_READ_COMMANDS.map((entry) => entry.toLowerCase()), ...extra]
+  const deny = new Set(names.map((entry) => executableName(entry).toLowerCase()))
+  const dropped = guard.denyCommandsOnly
+    ? DEFAULT_READ_COMMANDS.filter((entry) => !deny.has(entry.toLowerCase()))
+    : []
   return {
     reads: guard.reads,
     shells: guard.shells,
     redactOutput: guard.redactOutput,
     marker: guard.marker,
-    deny: new Set(names.map((entry) => executableName(entry.trim()).toLowerCase())),
+    deny,
+    dropped,
   }
 }
 
@@ -1438,6 +1469,11 @@ export function apply(ctx: Context, config: EnvInjectorConfig): void {
     note(log, 'info', line)
     if (state === 'unavailable' && compiled.guard.redactOutput) {
       note(log, 'warn', 'guard.redactOutput is on but no tools service is mounted; injected values can still be echoed into a result')
+    }
+    /* Opting out of the built-in reader list is legitimate but must never be
+     * silent: the log is where an operator checks what is actually protected. */
+    if (compiled.guard.dropped.length > 0) {
+      note(log, 'warn', `guard.denyCommandsOnly is on: the built-in read commands are NOT refused (${compiled.guard.dropped.join(', ')}); only denyCommands applies`)
     }
   }
 

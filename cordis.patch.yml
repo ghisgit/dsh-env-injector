@@ -85,8 +85,11 @@
         # "read guard" section states exactly what they do and do not stop.
         #
         #   reads: true        refuse injection into env/printenv-style commands
-        #                      (the built-in list; a non-empty `denyCommands`
-        #                      REPLACES it rather than extending it)
+        #                      (the built-in list, plus anything in
+        #                      `denyCommands`, which can only ADD refusals;
+        #                      `denyCommandsOnly: true` is the one deliberate
+        #                      way to drop the built-in list, and the load
+        #                      notice names what it dropped)
         #   shells: model      also refuse every caller-composed `bash -c '…'`
         #                      command line. The default `off` keeps
         #                      `bash -c 'git push'` working, and is also why

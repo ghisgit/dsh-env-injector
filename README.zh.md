@@ -165,7 +165,8 @@ env-injector:
     shells: off                      # 默认 off：`bash -c '…'` 命令行仍会拿到值
     redactOutput: true               # 默认 true：把注入过的值从工具结果里抹掉
     marker: '[redacted:{name}]'      # 默认值：替换文本，{name} 为变量名
-    denyCommands: []                 # 默认 []：使用内置读取命令表；非空则**替换**它
+    denyCommands: []                 # 默认 []：在内置读取命令表之外**追加**要拒绝的命令
+    denyCommandsOnly: false          # 默认 false：true 表示放弃内置表，只用 denyCommands
 ```
 
 `command` 与 `argsPattern` 是**正则源码字符串**，不是 `/…/` 字面量——settings 段必须
@@ -192,15 +193,18 @@ env-injector:
 env-injector:
   guard:
     reads: true
-    denyCommands: []        # [] = 内置表；非空则**替换**它
+    denyCommands: ['tee', 'xxd']   # **追加**的读取命令；内置表依然生效
+    denyCommandsOnly: false        # true 才放弃内置表（加载时会警告）
 ```
 
 内置表：`env`、`printenv`、`set`、`export`、`declare`、`typeset`、`readonly`、
 `local`、`unset`、`compgen`，以及 PowerShell 的写法 `gci`、`Get-ChildItem`、
-`Get-Item`、`gi`（大小写不敏感，所以 Windows 的 `SET` 也覆盖）。拒绝会从该 spawn 中
-扣下**所有**命中的值，而不只是撞上读取命令的那条规则——`gh pr list | env` 里两者在
-同一个进程树中，只拒绝一半等于没防。拒绝会记为
-`guard: refused GH_TOKEN (rule 0) for: gh, env`，按（变量, 命令行）各报一次。
+`Get-Item`、`gi`（大小写不敏感，所以 Windows 的 `SET` 也覆盖）。`denyCommands` 只能
+**追加**——配置这个安全开关不可能顺手削弱它，所以写一个已在内置表里的名字只是冗余，
+而不是把它删掉的手段。`denyCommandsOnly: true` 是唯一刻意的退出方式，加载提示会点名
+列出因此失效的内置项。拒绝会从该 spawn 中扣下**所有**命中的值，而不只是撞上读取命令
+的那条规则——`gh pr list | env` 里两者在同一个进程树中，只拒绝一半等于没防。拒绝会
+记为 `guard: refused GH_TOKEN (rule 0) for: gh, env`，按（变量, 命令行）各报一次。
 
 **B 层 — 抹掉结果里的值（`guard.redactOutput`，默认开）。** 本插件注入过的每个值，在
 工具结果里都会被 `guard.marker`（`[redacted:GH_TOKEN]`）替换，包括其原文形式和一次
@@ -410,24 +414,46 @@ gh auth setup-git          # 写入 credential.https://github.com.helper = !gh a
 
 ## 安全说明
 
-* 命中的命令——以及**它 spawn 的一切**——都能读到注入的值。规则要窄；
-  `command: '.*'` 等于把 token 转发给每个子进程。
-* 值默认覆盖 `spec.env` 中显式给出的条目（`overrideExisting: true`），所以模型提供的
-  `env` 无法伪造 token。设为 `false` 可让显式的调用方值胜出。
-* 注入按设计总是胜过 harness 的清洗：它就是可信调用方会使用的那层显式 `env`。清洗继续
+### 插件绝不会做的事
+
+* **值永不进日志。** 每条提示只写变量名、规则下标和命令行，绝不写内容。
+  `logMatches` 写的是 `injected GH_TOKEN for: …`，不是 token。
+* **`process.env` 从不被写入**，spec 构造完成后也不保留值：打码运行时按名字现读变量。
+* **被拒绝的 spawn 保留调用方原 spec 对象**，所以 guard 无法改变获准 spawn 的执行内容。
+* **默认 `overrideExisting: true`**，模型提供的 `env` 无法伪造成 harness 拥有的变量。
+  设为 `false` 可让显式的调用方值胜出。
+* **注入按设计胜过 harness 的清洗**：它就是可信调用方会使用的那层显式 `env`。清洗继续
   保护其他所有变量和所有未命中的命令。
-* **读防护挡不住什么**（默认 `reads: true` + `shells: off`）：
-  * `bash -c 'echo $GH_TOKEN'` 仍会拿到变量——模型的 shell 命令行与别的命令一样被注入，
-    只有输出打码挡在值和模型之间。要拒绝它就把 `guard.shells` 设为 `model`。
-  * 打码是按值匹配，所以它不认识的变化形式（另一种编码、切分、取子串、逐字符改写）会
-    穿过去。它也只能看到以文本块呈现给模型的结果。
-  * 拿到值的命令可以**不打印**就泄漏：写进文件、喂给 hook 或另一个程序、通过网络发出。
-    `git push` 会执行 `.git/hooks/*`，而拥有 workspace 写权限的模型可以自己写一个。
-    任何环境变量层的防护都看不到这些。
-  * 所以它是*带清晰审计线索的减害*，不是隔离。真正的隔离需要独立 OS 用户、容器或凭据
-    代理——超出「环境变量注入插件」的范围。
-* 实践中的最小面：规则要窄（`^git(\.exe)?$` 配 `argsPattern`，而不是 `.*`）、
-  `guard.reads: true`，以及一个模型无法用来撰写「被注入命令将要执行的东西」的 workspace。
+* **`denyCommands` 只能追加拒绝项。** 内置读取命令表是地板，不是会被配置替换掉的默认
+  值；`denyCommandsOnly: true` 是唯一刻意的退出方式，加载提示会点名因此失效的项。
+
+### 读防护挡不住什么（默认 `reads: true` + `shells: off`）
+
+* `bash -c 'echo $GH_TOKEN'` 仍会拿到变量——模型的 shell 命令行与别的命令一样被注入，
+  只有输出打码挡在值和模型之间。`guard.shells: model` 能拒绝它，代价是
+  `bash -c 'git push'` 也不再可用。
+* **打码是字面量匹配，它不认识的变化形式会穿过去。** 本仓库实测确认：双重 base64、
+  大写 hex、逐字符插空格的值都会原样送达。只覆盖一次 base64/hex。
+* **短于 8 字节的值永不脱敏**（否则 4 位 PIN 会重写无关结果）。短凭据会以明文传输；
+  见「限制」一节。
+* **只有文本块被改写。** JSON 结果的 `value` 与任何非文本块按引用透传，所以工具以结构化
+  数据形式给出的密钥不会被抹掉。
+* **值一旦轮换就立刻失去保护。** 打码读的是变量的*当前*值，所以拿到旧值的 spawn 在结果
+  被抹除之前若发生轮换，旧值就留在明文中。长期会话（PTY、后台 job 稍后的输出）最容易踩。
+* 拿到值的命令可以**不打印**就泄漏：写进文件、喂给 hook 或另一个程序、通过网络发出。
+  `git push` 会执行 `.git/hooks/*`，而拥有 workspace 写权限的模型可以自己写一个。
+  任何环境变量层的防护都看不到这些。
+* 读取命令表是对命令名的启发式，不是边界。`cat /proc/self/environ`、某语言运行时的
+  `os.environ`、模型自己写的脚本，按构造都在其触及范围之外；它存在的意义是让插件不会把
+  值*交到*一个明显的读取者手里。
+* 所以它是*带清晰审计线索的减害*，不是隔离。真正的隔离需要独立 OS 用户、容器或凭据
+  代理——超出「环境变量注入插件」的范围。
+
+### 实践中的最小面
+
+规则要窄（`^git(\.exe)?$` 配 `argsPattern`，而不是 `.*`）、`guard.reads: true`、一个
+模型无法用来撰写「被注入命令将要执行的东西」的 workspace；而当 token 必须完全不可读时，
+用 `guard.shells: model`，并把凭据换成**不是环境变量**的形态。
 
 ## 限制
 
@@ -439,18 +465,19 @@ gh auth setup-git          # 写入 credential.https://github.com.helper = !gh a
 * 包装命令之后的裸数字操作数会被跳过（`nice -n 5 gh`），但规则不会针对包装命令自身的
   参数求值。
 * 规则数组是整体替换；没有按规则合并，也没有稳定的规则 id。
-* guard 的读取命令表是对命令名的启发式，不是边界：任何能读环境的东西
-  （`cat /proc/self/environ`、某语言运行时的 `os.environ`、模型自己写的脚本）都在其
-  触及范围之外。它的存在是为了让插件不会把值*交到*一个明显的读取者手里。
-* 打码忽略短于 8 字节的值；如果某个值本身就是常见词，它会在此值出现的任何地方被打码
-  ——guard 不打算在这两种情况下自作聪明。
+* 打码忽略短于 8 字节的值——短凭据因此完全没有输出保护；如果某个值本身就是常见词，它
+  会在此值出现的任何地方被打码。guard 不打算在这两种情况下自作聪明；请优先使用长且高
+  熵的值。
+* 打码只覆盖一次编码（base64、hex）且只覆盖文本块；不认识的变化形式见「安全说明」。
+* 规则正则是在编译配置时校验的，不是由 schema 校验，所以 `settings.yaml` 里的坏模式会在
+  读取时被拒绝、上一份规则继续生效——该 spawn 保持旧行为，而不是静默失去注入。
 
 ## 开发
 
 ```bash
 pnpm install                    # 如果你的镜像缺 rc 构建，加 --registry=https://registry.npmjs.org/
 pnpm build                      # tsc → lib/（已提交：loader 导入的是 lib/index.js）
-pnpm test                       # 84 个测试：匹配、注入、guard、打码、实时 settings、回退、打包
+pnpm test                       # 85 个测试：匹配、注入、guard、打码、实时 settings、回退、打包
 pnpm resolve-rules              # 当前真正生效的规则 AND guard 状态
 pnpm acceptance                 # 真实 seam：真实子进程、真实工具注册表、真实 settings.yaml
 ```

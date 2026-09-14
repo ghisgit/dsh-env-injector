@@ -139,13 +139,30 @@ test('turning the read guard off is the documented opt-out', () => {
   assert.deepEqual(result.blocked, [])
 })
 
-test('denyCommands replaces the built-in reader list', () => {
+test('denyCommands EXTENDS the built-in reader list', () => {
+  /* Adding a reader must never remove one: a security switch that silently
+   * weakens protection when configured is the bug this pins. */
   const custom = compiled([ruleFor('^gh$')], Config({ guard: { denyCommands: ['tee'] } }).guard)
   assert.deepEqual(injectEnvForSpec(shell('gh pr list | tee out.txt'), custom).injected, [], 'tee is refused')
-  /* With the list replaced, the built-in names are no longer refused by the
-   * guard — a deliberate, documented consequence of "replaces". */
-  const stillInjects = injectEnvForSpec(shell('env GH_TOKEN=x gh pr list'), custom)
-  assert.deepEqual(stillInjects.injected, ['GUARD_TOKEN'])
+  assert.deepEqual(
+    injectEnvForSpec(shell('env GH_TOKEN=x gh pr list'), custom).injected,
+    [],
+    'and the built-in readers are still refused alongside it',
+  )
+  const names = compileConfig(Config({ guard: { denyCommands: ['tee'] } })).guard.deny
+  assert.equal(names.has('tee'), true)
+  assert.equal(names.has('env'), true, 'the built-in list is a floor, not a default that gets replaced')
+  assert.equal(names.has('printenv'), true)
+})
+
+test('the built-in list can be opted out of explicitly, and the opt-out is reported', () => {
+  const only = compileConfig(Config({ guard: { denyCommandsOnly: true, denyCommands: ['tee'] } })).guard
+  assert.equal(only.deny.has('tee'), true)
+  assert.equal(only.deny.has('env'), false, 'denyCommandsOnly is the deliberate way to drop the built-ins')
+  assert.equal(only.dropped.includes('env'), true, 'and the dropped names are reported for the load notice')
+  assert.equal(only.dropped.includes('printenv'), true)
+  /* The default configuration reports nothing dropped. */
+  assert.deepEqual(compileConfig(Config({})).guard.dropped, [])
 })
 
 test('a deployment can name its own readers', () => {

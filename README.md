@@ -178,7 +178,8 @@ env-injector:
     shells: off                      # default off: a `bash -c '…'` command line still receives values
     redactOutput: true               # default true: scrub injected values out of tool results
     marker: '[redacted:{name}]'      # default: replacement text, {name} = the variable
-    denyCommands: []                 # default []: use the built-in reader list; non-empty REPLACES it
+    denyCommands: []                 # default []: EXTRA readers to refuse, on top of the built-in list
+    denyCommandsOnly: false          # default false: true drops the built-in list, keeping only denyCommands
 ```
 
 `command` and `argsPattern` are **regex source strings**, never `/…/` literals —
@@ -211,13 +212,18 @@ as a pipeline stage, or as a wrapper.
 env-injector:
   guard:
     reads: true
-    denyCommands: []        # [] = the built-in list; non-empty REPLACES it
+    denyCommands: ['tee', 'xxd']   # EXTRA readers; the built-in list stays in force
+    denyCommandsOnly: false        # true drops the built-in list (and warns at load)
 ```
 
 Built-in list: `env`, `printenv`, `set`, `export`, `declare`, `typeset`,
 `readonly`, `local`, `unset`, `compgen`, and the PowerShell spellings `gci`,
 `Get-ChildItem`, `Get-Item`, `gi` (matching is case-insensitive, so Windows'
-`SET` is covered too). The refusal withholds **every** matched value from that
+`SET` is covered too). `denyCommands` can only ADD to that list — configuring the
+guard cannot weaken it by accident, which is why an entry that names a built-in
+is simply redundant rather than a way to drop it. `denyCommandsOnly: true` is the
+one deliberate way out, and the load notice names every built-in it took out of
+force. The refusal withholds **every** matched value from that
 spawn, not just the rule that hit a reader — `gh pr list | env` runs both in one
 process tree, so a partial refusal would protect nothing. A refusal is logged as
 `guard: refused GH_TOKEN (rule 0) for: gh, env`, once per variable and command
@@ -455,32 +461,64 @@ so `git push` over HTTPS works without an interactive prompt.
 
 ## Security notes
 
-* A matched command — and **everything it spawns** — can read the injected
-  value. Keep rules narrow; `command: '.*'` forwards the token to every child.
-* The value overrides an explicit `spec.env` entry by default
-  (`overrideExisting: true`) so a model-supplied `env` cannot spoof the token.
-  Set it to `false` to let an explicit caller value win.
-* Injection always wins over the harness scrub *by design*: it is the same
+### What the plugin never does
+
+* **No value is ever logged.** Every notice names variables, rules and command
+  lines — never their contents. `logMatches` writes `injected GH_TOKEN for: …`,
+  not the token.
+* **`process.env` is never written**, and no value is retained after the spec is
+  built: redaction re-reads the variable by name when it runs.
+* **A refused spawn keeps the caller's original spec object**, so the guard
+  cannot change what a permitted spawn executes.
+* **`overrideExisting: true` by default**, so a model-supplied `env` cannot
+  spoof a var the harness owns. Set it to `false` to let an explicit caller
+  value win.
+* **Injection wins over the harness scrub by design**: it is the same
   explicit-`env` layer a trusted caller would use. The scrub keeps protecting
   every other variable and every non-matching command.
-* **What the read guard does not stop** (the defaults, `reads: true` +
-  `shells: off`):
-  * `bash -c 'echo $GH_TOKEN'` still receives the variable — the model's shell
-    command line is injected like any other, and only output redaction stands
-    between that value and the model. Set `guard.shells: model` to refuse it.
-  * Redaction matches the value, so a transformation it does not know
-    (another encoding, a split, a substring, a character-wise rewrite) passes
-    through. It also only sees results the model is shown in text blocks.
-  * A command that receives the value can leak it **without printing it**:
-    writing it to a file, feeding it to a hook or another program, sending it
-    over the network. `git push` runs `.git/hooks/*`, which a model with
-    workspace write access can author. No environment-layer guard can see that.
-  * This is therefore *harm reduction with a clear audit trail*, not isolation.
-    Real isolation is a separate OS user, a container, or a credential proxy —
-    out of scope for an environment-injection plugin.
-* The practical minimum: narrow rules (`^git(\.exe)?$` with an `argsPattern`,
-  not `.*`), `guard.reads: true`, and a harness whose workspace the model cannot
-  use to author what an injected command will execute.
+* **`denyCommands` can only add refusals.** The built-in reader list is a floor,
+  not a default that configuration replaces; `denyCommandsOnly: true` is the one
+  deliberate way to drop it, and the load notice names what it dropped.
+
+### What the read guard does NOT stop (defaults: `reads: true`, `shells: off`)
+
+* `bash -c 'echo $GH_TOKEN'` still receives the variable — the model's shell
+  command line is injected like any other, and output redaction is the only
+  thing between that value and the model. `guard.shells: model` refuses it, at
+  the cost of `bash -c 'git push'` no longer working.
+* **Redaction is a literal match, so a transform it does not know passes
+  through.** Verified in this repository: double base64, upper-case hex, and a
+  character-spaced value are all delivered untouched. One base64/hex step is
+  covered; more is not.
+* **Values shorter than 8 bytes are never redacted** (a 4-digit PIN would
+  otherwise rewrite unrelated results). A short credential travels in plain
+  text; see the Limitations section.
+* **Only text blocks are rewritten.** A JSON result's `value` and any non-text
+  block pass through by reference, so a secret that a tool reports as structured
+  data is not scrubbed.
+* **A rotated value loses its protection immediately.** Redaction reads the
+  variable's *current* value, so a spawn that received the previous value keeps
+  it in plain text if the variable is rotated before the result is scrubbed.
+  Long-lived sessions (a PTY, a background job's later output) are where this
+  bites.
+* A command that receives the value can leak it **without printing it**: writing
+  it to a file, feeding it to a hook or another program, sending it over the
+  network. `git push` runs `.git/hooks/*`, which a model with workspace write
+  access can author. No environment-layer guard can see that.
+* The reader list is a heuristic over command names. `cat /proc/self/environ`, a
+  language runtime's `os.environ`, or a script the model writes are all outside
+  its reach by construction; it exists so the plugin does not *hand* a value to
+  an obvious reader.
+* This is therefore *harm reduction with a clear audit trail*, not isolation.
+  Real isolation is a separate OS user, a container, or a credential proxy —
+  out of scope for an environment-injection plugin.
+
+### The practical minimum
+
+Narrow rules (`^git(\.exe)?$` with an `argsPattern`, not `.*`), `guard.reads:
+true`, a workspace the model cannot use to author what an injected command will
+execute, and — when the token must not be readable at all — `guard.shells: model`
+plus a credential that is not an environment variable.
 
 ## Limitations
 
@@ -495,20 +533,23 @@ so `git push` over HTTPS works without an interactive prompt.
 * Bare numeric operands after a wrapper are skipped (`nice -n 5 gh`), but a rule
   is not evaluated against a wrapper's own arguments.
 * Rule arrays replace wholesale; there is no per-rule merge or stable rule id.
-* The guard's reader list is a heuristic over command names, not a boundary:
-  anything that can read the environment (`cat /proc/self/environ`, a language
-  runtime's `os.environ`, a script the model writes) is out of its reach. It
-  exists to stop the plugin from *handing* a value to an obvious reader.
-* Redaction ignores values shorter than 8 bytes, and a value that is a common
-  word would be redacted wherever it appears — the guard does not try to be
-  clever about either case.
+* Redaction ignores values shorter than 8 bytes — a short credential therefore
+  has no output protection at all, and a value that is a common word would be
+  redacted wherever it appears. The guard does not try to be clever about either
+  case; prefer long, high-entropy values.
+* Redaction covers one encoding step (base64, hex) and text blocks only; see the
+  security notes for the transformations it does not catch.
+* Rule regexes are validated when the config is compiled, not by the schema, so
+  a bad pattern in `settings.yaml` is refused at read time and the previous
+  rules stay in force — the spawn keeps its old behaviour rather than losing
+  injection silently.
 
 ## Development
 
 ```bash
 pnpm install                    # add --registry=https://registry.npmjs.org/ if your mirror lacks the rc builds
 pnpm build                      # tsc → lib/ (committed: the loader imports lib/index.js)
-pnpm test                       # 84 tests: matching, injection, guard, redaction, live settings, fallback, packaging
+pnpm test                       # 85 tests: matching, injection, guard, redaction, live settings, fallback, packaging
 pnpm resolve-rules              # which rules AND which guard are really in force right now
 pnpm acceptance                 # the real seams: real child process, real tool registry, real settings.yaml
 ```

@@ -228,7 +228,7 @@ test('the schema resolves defaults and stays JSON-shaped', () => {
     overrideExisting: true,
     terminal: true,
     logMatches: false,
-    guard: { reads: true, shells: 'off', redactOutput: true, marker: '[redacted:{name}]', denyCommands: [] },
+    guard: { reads: true, shells: 'off', redactOutput: true, marker: '[redacted:{name}]', denyCommands: [], denyCommandsOnly: false },
   })
   assert.deepEqual(structuredClone(resolved), resolved, 'the resolved section survives a JSON round trip')
   assert.deepEqual(Config({ overrideExisting: false }).rules, [], 'omitting `rules` resolves to an empty list')

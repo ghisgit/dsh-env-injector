@@ -94,8 +94,8 @@ console.log(
  * "what is configured" and miss "what will happen". */
 console.log(`READ GUARD (${winner[0]}): ${describeGuard(compileConfig(winner[1]).guard)}`)
 console.log(
-  'note: reads=deny refuses injection into env/printenv-style commands; ' +
-    'shells=off still delivers to a shell command line, redact=on is the fallback for that'
+  'note: reads=deny refuses injection into env/printenv-style commands (built-in list ' +
+    'plus denyCommands); shells=off still delivers to a shell command line, redact=on is the fallback for that'
 )
 console.log(
   `note: terminal=${entryConfig.terminal} comes from the COMPOSITION entry ` +
