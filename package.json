@@ -1,6 +1,6 @@
 {
   "name": "dsh-env-injector",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DSH plugin: rule-driven, per-spawn environment injection (e.g. GH_TOKEN for gh/git) with hot-reloadable settings",
   "repository": {
     "type": "git",
